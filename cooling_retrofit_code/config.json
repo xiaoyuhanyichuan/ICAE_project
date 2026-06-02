@@ -1,0 +1,207 @@
+{
+  "paths": {
+    "data_dir": "D:\\paper\\real_data",
+    "output_dir": "D:\\paper\\cooling_retrofit_code\\results"
+  },
+  "scenario": {
+    "time_mode": "typical_days",
+    "room_replication_factor": 5.0,
+    "thermal_slack_penalty": 1000000.0,
+    "heat_demand_scaling": {
+      "enabled": true,
+      "method": "peak_ratio_to_it_load",
+      "target_peak_fraction_of_it_load": 0.9,
+      "allow_upscale": false,
+      "source": "Raw building heat demand peak is about 8 MW while IT waste-heat peak is below 1 MW; scale heat demand proportionally as the model input scenario."
+    },
+    "business_growth": {
+      "mode": "simulated",
+      "distribution": "uniform",
+      "random_seed": 20260601,
+      "rho_load_min": 0.05,
+      "rho_load_max": 0.25,
+      "planning_horizon_years": 1.0,
+      "source": "Rack-level simulated scenario values for model Section 5.1 rho_i_load because measured rack business growth data are not available."
+    },
+    "ac_aging": {
+      "mode": "simulated",
+      "distribution": "uniform",
+      "random_seed": 20260601,
+      "alpha_age_min": 0.08,
+      "alpha_age_max": 0.25,
+      "epsilon_age_fallback": "alpha_age",
+      "source": "AC-unit-level simulated scenario values for model Section 5.2 alpha_z_age because measured AC aging and efficiency degradation data are not available."
+    }
+  },
+  "decision_bounds": {
+    "default_zone_cap_upper_kw": 5000,
+    "default_system_cap_upper_kw": 20000,
+    "zone_cap_upper_kw": {
+      "cap_ac_new": 5000,
+      "cap_rdhx": 5000,
+      "cap_cdu": 5000
+    },
+    "system_cap_upper_kw": {
+      "cap_ashp": 20000,
+      "cap_wshp": 20000,
+      "cap_bess": 40000,
+      "cap_tes": 40000,
+      "delta_cap_chiller": 20000,
+      "delta_cap_tower": 25000
+    }
+  },
+  "typical_days": {
+    "enabled": true,
+    "k": 8,
+    "random_seed": 42,
+    "append_peak_day": true,
+    "feature_columns": [
+      "it_load_kw",
+      "price_yuan_per_kwh",
+      "carbon_kg_per_kwh",
+      "outdoor_temp_c",
+      "heating_demand_kw"
+    ]
+  },
+  "solver": {
+    "gurobi": {
+      "time_limit_seconds": 120,
+      "mip_gap": 0.01,
+      "threads": 0
+    },
+    "nsga2": {
+      "population_size": 96,
+      "generations": 80,
+      "crossover_probability": 0.9,
+      "mutation_probability": 0.15,
+      "random_seed": 42
+    }
+  },
+  "convergence": {
+    "min_generation": 20,
+    "patience_generations": 10,
+    "hv_relative_tolerance": 0.003,
+    "igd_plus_relative_tolerance": 0.003,
+    "reference_point": [
+      1.1,
+      1.1
+    ]
+  },
+  "technology": {
+    "configurations": {
+      "0": "existing_ac",
+      "1": "new_ac",
+      "2": "new_ac_with_ashp",
+      "3": "new_ac_high_efficiency",
+      "4": "cold_plate_cdu_wshp",
+      "5": "rdhx_wshp",
+      "6": "cold_plate_cdu_wshp_plus_air"
+    },
+    "fitted": {
+      "e_rdhx_kw_per_kw": 0.0265,
+      "cop_chiller": 3.0,
+      "ac_fan_kw_per_kw": 0.2137
+    },
+    "cop_ashp": 3.2,
+    "cop_wshp": 4.0,
+    "tower_kw_per_kw_heat": 0.015,
+    "cdu_pump_kw_per_kw": 0.02,
+    "tes_loss_per_hour": 0.002,
+    "bess_roundtrip_efficiency": 0.9,
+    "bess": {
+      "c_rate_per_hour": 0.5
+    },
+    "existing_chiller_kw": 18000,
+    "existing_tower_kw": 24000
+  },
+  "economics": {
+    "discount_rate": 0.06,
+    "project_life_years": 15,
+    "heat_credit_yuan_per_kwh": 0.2,
+    "capex_yuan_per_kw": {
+      "ac_new": 900,
+      "rdhx": 1200,
+      "cdu": 1300,
+      "ashp": 1200,
+      "wshp": 1200,
+      "chiller": 1000,
+      "tower": 220,
+      "tes": 180,
+      "bess": 330
+    },
+    "fixed_om_yuan_per_kw_year": {
+      "ac_new": 0,
+      "rdhx": 0,
+      "cdu": 0,
+      "ashp": 0,
+      "wshp": 0,
+      "chiller": 0,
+      "tower": 0,
+      "tes": 0,
+      "bess": 0
+    },
+    "retrofit_fixed_yuan": {
+      "0": 0,
+      "1": 5000,
+      "2": 6500,
+      "3": 6200,
+      "4": 9000,
+      "5": 8500,
+      "6": 10500
+    }
+  },
+  "carbon": {
+    "allow_negative_operational_carbon": false,
+    "heat_displacement_kg_per_kwh": 0.11,
+    "embodied_kg_per_kw": {
+      "ac_new": 80,
+      "rdhx": 120,
+      "cdu": 5,
+      "ashp": 12,
+      "wshp": 12,
+      "chiller": 130,
+      "tower": 5,
+      "tes": 10,
+      "bess": 90
+    },
+    "retrofit_fixed_kg": {
+      "0": 0,
+      "1": 400,
+      "2": 520,
+      "3": 500,
+      "4": 700,
+      "5": 650,
+      "6": 820
+    }
+  },
+  "weight": {
+    "floor_limit_kg_per_m2": 800,
+    "zone_floor_area_m2": 12,
+    "rack_static_kg": 900,
+    "equipment_kg_per_kw": {
+      "ac_new": 5,
+      "rdhx": 6,
+      "cdu": 5,
+      "bess": 10,
+      "tes": 4
+    },
+    "soft_constraint": {
+      "enabled": true,
+      "cost_penalty_yuan_per_kg_year": 500,
+      "carbon_penalty_kg_per_kg_year": 0,
+      "source": "Soft penalty for exceeding floor load-bearing margin; replace with project-specific structural reinforcement cost and embodied carbon if available."
+    }
+  },
+  "assumptions": {
+    "economic_defaults": {
+      "source": "D:\\paper\\原研究问题\\可参考数据.md plus D:\\paper\\原研究问题\\原来的代码\\config.json fallback",
+      "confidence": "medium",
+      "description": "User-fitted coefficients override these values; cost/carbon defaults are placeholders until project-specific vendor quotations are available."
+    },
+    "fitted_coefficients": {
+      "source": "fitted",
+      "confidence": "high",
+      "description": "RDHX, chiller COP, and AC fan coefficients supplied by the researcher."
+    }
+  }
+}

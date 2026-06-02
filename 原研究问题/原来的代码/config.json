@@ -1,0 +1,383 @@
+﻿{
+  "project": {
+    "name": "Data center retrofit cost-carbon multi-objective optimization",
+    "horizon_hours": 8760,
+    "random_seed": 42
+  },
+  "existing": {
+    "n_racks_total": 120,
+    "n_crac_old": 120,
+    "cap_crac_unit_kw": 120.0,
+    "cap_chiller_old_kw": 15000.0,
+    "cap_tower_old_kw": 20000.0
+  },
+  "economics": {
+    "discount_rate": 0.08,
+    "lifetime_years_default": 20,
+    "lifetime_years_hx": 10,
+    "lifetime_years": {
+      "cabinet_lc": 20,
+      "cdu": 20,
+      "hp": 20,
+      "bess_power": 20,
+      "bess_energy": 20,
+      "tes": 20,
+      "tower": 20,
+      "hx": 10,
+      "crac_dispose": 20
+    },
+    "price_heat_yuan_per_kwh": 0.325,
+    "price_grid_flat_yuan_per_kwh": 0.6,
+    "capex": {
+      "cabinet_lc_yuan_per_cabinet": 20000.0,
+      "cdu_yuan_per_kw": 2000.0,
+      "hp_yuan_per_kw": 2000.0,
+      "tes_yuan_per_kwh": 150.0,
+      "tower_yuan_per_kw": 1000.0,
+      "hx_yuan_per_kw": 800.0,
+      "bess_energy_yuan_per_kwh": 600.0,
+      "bess_power_yuan_per_kw": 1000.0
+    },
+    "fom_ratio": {
+      "it": 0.04,
+      "lc": 0.03,
+      "air": 0.03,
+      "chiller": 0.03,
+      "hp": 0.03,
+      "hx": 0.03,
+      "bess": 0.03,
+      "tes": 0.01,
+      "tower": 0.03,
+      "cdu": 0.03
+    },
+    "vom": {
+      "lc_yuan_per_kwh": 0.015,
+      "air_yuan_per_kwh": 0.025,
+      "chiller_yuan_per_kwh": 0.02,
+      "hp_yuan_per_kwh": 0.02,
+      "bess_yuan_per_kwh": 0.0,
+      "tes_yuan_per_kwh": 0.002
+    }
+  },
+  "technical": {
+    "cop": {
+      "hp": 5.0,
+      "chiller": 5.5,
+      "crac": 5.5,
+      "cdu": 5.0,
+      "tower": 20.0
+    },
+    "eta": {
+      "plate": 0.9,
+      "hx": 0.85,
+      "boiler": 0.9,
+      "bess_charge": 0.95,
+      "bess_discharge": 0.95,
+      "tes_charge": 0.9,
+      "tes_discharge": 0.9
+    },
+    "bess": {
+      "dod_max": 0.8,
+      "self_discharge_per_h": 0.0001,
+      "n_cycle": 6000
+    },
+    "tes": {
+      "self_discharge_per_h": 0.0015,
+      "max_c_rate": 0.25
+    },
+    "redundancy": {
+      "crac": 1.2,
+      "chiller": 1.2,
+      "cdu": 1.15,
+      "tower": 1.2
+    }
+  },
+  "carbon": {
+    "grid_cf_flat_kg_per_kwh": 0.58,
+    "boiler_cf_kg_per_kwh_heat": 0.22,
+    "embodied": {
+      "cabinet_lc_kg_per_cabinet": 500.0,
+      "cdu_kg_per_kw": 60.0,
+      "hp_kg_per_kw": 34.0,
+      "bess_energy_kg_per_kwh": 140.0,
+      "bess_power_kg_per_kw": 34.0,
+      "tes_kg_per_kwh": 15.0,
+      "tower_kg_per_kw": 118.0,
+      "hx_kg_per_kw": 40.0,
+      "crac_dispose_kg_per_unit": 200.0
+    }
+  },
+  "model2": {
+    "seed": 2042,
+    "n_zone": 4,
+    "n_group": 3,
+    "compat_prob": [
+      0.9,
+      0.65,
+      0.25
+    ],
+    "eta_lc_group": [
+      0.9,
+      0.78,
+      0.62
+    ],
+    "branch_cap_factor_mean": 1.25,
+    "branch_cap_kw_mean": 120.0,
+    "c_fix_mean": 18000.0,
+    "c_fix_std": 3500.0,
+    "c_plate_mean": 2600.0,
+    "c_plate_std": 400.0,
+    "c_pipe_unit_mean": 220.0,
+    "c_pipe_unit_std": 35.0,
+    "pipe_len_mean": 24.0,
+    "pipe_len_std": 8.0,
+    "c_downtime_mean": 7500.0,
+    "c_downtime_std": 1600.0,
+    "ei_fix_mean": 420.0,
+    "ei_fix_std": 70.0,
+    "ei_plate_mean": 38.0,
+    "ei_plate_std": 8.0,
+    "ei_pipe_unit_mean": 9.0,
+    "ei_pipe_unit_std": 2.0,
+    "ei_downtime_mean": 45.0,
+    "ei_downtime_std": 12.0,
+    "w_old_mean": 850.0,
+    "w_old_std": 120.0,
+    "w_fix_mean": 55.0,
+    "w_fix_std": 12.0,
+    "w_plate_mean": 7.5,
+    "w_plate_std": 2.0,
+    "w_rack_max_mean": 1300.0,
+    "w_rack_max_std": 80.0,
+    "w_point_max_mean": 1250.0,
+    "w_point_max_std": 80.0,
+    "a_room_lc_avail": 65.0,
+    "rho_cdu_area": 0.0009,
+    "rho_hx_area": 0.0006,
+    "a_crac_unit": 3.2,
+    "rho_cdu_weight": 0.12,
+    "cdu_zone": 0,
+    "floor_load_max_kg": [
+      120000.0,
+      120000.0,
+      120000.0,
+      120000.0
+    ],
+    "area_zone_m2": [
+      120.0,
+      120.0,
+      120.0,
+      120.0
+    ],
+    "cap_air_zone_kw": [
+      4500.0,
+      5000.0,
+      5200.0,
+      4800.0
+    ],
+    "cap_air_daily_amp": 0.1,
+    "t_sup_zone_c": [
+      21.5,
+      22.0,
+      22.2,
+      21.8
+    ],
+    "beta_zone": [
+      0.0012,
+      0.0012,
+      0.0011,
+      0.0012
+    ],
+    "t_inlet_max_c": 27.0,
+    "lambda_hot": 10000.0,
+    "cdu_curve": {
+      "p_idle_kw": 70.0,
+      "p_rated_kw": 850.0,
+      "a1": 0.25,
+      "a2": 0.35,
+      "a3": 0.4
+    },
+    "tower_curve": {
+      "p_idle_kw": 25.0,
+      "p_fan_rated_kw": 620.0,
+      "alpha_wb": 0.015,
+      "t_wb_ref_c": 20.0
+    },
+    "rack_load": {
+      "rack_col_prefix": "rack_it_",
+      "rack_col_width": 3,
+      "require_explicit_rack_cols": false,
+      "synthetic_heterogeneity_cv": 0.25,
+      "synthetic_noise_cv": 0.05,
+      "synthetic_phase_std_h": 1.5
+    },
+    "server_groups": {
+      "heat_share": [
+        0.5,
+        0.3,
+        0.2
+      ],
+      "heat_share_jitter": 0.08
+    },
+    "typical_days": {
+      "n_typical": 4,
+      "include_peak_day": true,
+      "peak_weight_days": 1.0
+    },
+    "thermal_topology": {
+      "use_hji": false,
+      "h_matrix_path": "data/H_matrix.csv"
+    },
+    "pwl": {
+      "segments_cdu": 6,
+      "segments_tower": 6
+    }
+  },
+  "decision_bounds": {
+    "n_lc": [
+      0,
+      120
+    ],
+    "n_crac_remove": [
+      0,
+      20
+    ],
+    "cap_hp_kw": [
+      0.0,
+      20000.0
+    ],
+    "cap_bess_e_kwh": [
+      0.0,
+      50000.0
+    ],
+    "cap_bess_p_kw": [
+      0.0,
+      20000.0
+    ],
+    "cap_tes_kwh": [
+      0.0,
+      120000.0
+    ],
+    "cap_cdu_kw": [
+      0.0,
+      25000.0
+    ],
+    "cap_tower_kw": [
+      0.0,
+      10000.0
+    ],
+    "cap_hx_kw": [
+      0.0,
+      25000.0
+    ]
+  },
+  "solver": {
+    "outer_engine": "pymoo",
+    "population_size": 72,
+    "generations": 40,
+    "crossover_prob": 0.9,
+    "mutation_prob": 0.12,
+    "eta_c": 20.0,
+    "eta_m": 20.0,
+    "parallel": {
+      "enabled": true,
+      "strict": false,
+      "workers": 2,
+      "chunksize": 1
+    },
+    "cache": {
+      "enabled": true,
+      "max_entries": 10000,
+      "report_per_generation": true,
+      "adaptive_quantize_on_low_hit": true,
+      "min_hit_rate_target": 0.5,
+      "low_hit_quant_scale": 1.25,
+      "max_auto_quant_updates": 3,
+      "quant_steps": {
+        "cap_cdu_kw": 50.0,
+        "cap_hp_kw": 50.0,
+        "cap_tower_kw": 50.0,
+        "cap_hx_kw": 50.0,
+        "cap_bess_p_kw": 50.0,
+        "cap_bess_e_kwh": 100.0,
+        "cap_tes_kwh": 100.0
+      }
+    },
+    "feasibility_oracle": {
+      "enabled": true,
+      "violation_eps": 1e-06,
+      "skip_inner_on_infeasible": true,
+      "projection_enabled": true,
+      "project_cap_cdu": true,
+      "project_cap_hp": true,
+      "project_cap_tower": true,
+      "project_n_crac_remove": true
+    },
+    "diagnostic_slack": {
+      "enabled": true,
+      "eps": 1e-06,
+      "penalty_yuan_per_unit": 1000000000.0
+    },
+    "infeasibility_diagnosis": {
+      "enabled": true,
+      "rerun_inf_or_unbd": true,
+      "relax_on_inner_infeasible": true,
+      "repair_and_resolve_once": true,
+      "enable_infeasible_memory": true,
+      "memory_max_entries": 5000,
+      "relax_slack_ub": 1000000.0,
+      "relax_penalty_yuan_per_unit": 1000000000.0,
+      "diagnostic_time_limit_s": 20.0
+    },
+    "profiling": {
+      "enabled": false,
+      "small_run": true,
+      "small_population_size": 24,
+      "small_generations": 8,
+      "disable_two_stage": true,
+      "force_single_process": true,
+      "enable_line_profiler": false,
+      "profile_output_dir": "results/profile",
+      "sample_count": 120,
+      "pandas_numpy_top_k": 40
+    },
+    "two_stage": {
+      "enabled": false,
+      "stage1": {
+        "population_size": 72,
+        "generations": 60
+      },
+      "stage2": {
+        "population_size": 120,
+        "generations": 90
+      },
+      "pad_ratio": 0.35,
+      "abs_pad_ratio": 0.06
+    },
+    "convergence": {
+      "enabled": true,
+      "hv_ref_point": [
+        1.1,
+        1.1
+      ],
+      "stagnation_window": 5,
+      "hv_delta_tol": 0.001,
+      "igd_plus_delta_tol": 0.001
+    },
+    "inner": {
+      "engine": "gurobi",
+      "time_limit": 45.0,
+      "mip_gap": 0.05,
+      "threads": 1,
+      "persistent_template": true,
+      "mip_focus": 1,
+      "nodefile_start_gb": 0.5,
+      "numeric_focus": 1,
+      "output_flag": 0
+    }
+  },
+  "notes": [
+    "部分参数值在上传文档中存在乱码，默认值根据文档可识别字段+工程常识补齐。",
+    "后续只需修改本文件即可使用你的精确参数复现。"
+  ]
+}
