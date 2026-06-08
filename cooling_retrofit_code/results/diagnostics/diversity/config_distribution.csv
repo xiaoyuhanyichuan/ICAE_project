@@ -1,0 +1,15 @@
+﻿solution_class,config_id,config_label,zone_count,share
+dominated,0,existing_ac,18206,0.15991216512955644
+dominated,1,new_ac,9767,0.085788317962231
+dominated,2,new_ac_with_ashp,17897,0.15719806763285024
+dominated,3,new_ac_high_efficiency,10642,0.09347386912604304
+dominated,4,cold_plate_cdu_wshp,23392,0.2054633289415898
+dominated,5,rdhx_wshp,22576,0.19829600351339483
+dominated,6,cold_plate_cdu_wshp_plus_air,11370,0.09986824769433465
+pareto,0,existing_ac,40,0.16666666666666666
+pareto,1,new_ac,12,0.05
+pareto,2,new_ac_with_ashp,28,0.11666666666666667
+pareto,3,new_ac_high_efficiency,14,0.058333333333333334
+pareto,4,cold_plate_cdu_wshp,70,0.2916666666666667
+pareto,5,rdhx_wshp,61,0.25416666666666665
+pareto,6,cold_plate_cdu_wshp_plus_air,15,0.0625

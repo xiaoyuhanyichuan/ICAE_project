@@ -7,13 +7,6 @@
     "time_mode": "typical_days",
     "room_replication_factor": 5.0,
     "thermal_slack_penalty": 1000000.0,
-    "heat_demand_scaling": {
-      "enabled": true,
-      "method": "peak_ratio_to_it_load",
-      "target_peak_fraction_of_it_load": 0.9,
-      "allow_upscale": false,
-      "source": "Raw building heat demand peak is about 8 MW while IT waste-heat peak is below 1 MW; scale heat demand proportionally as the model input scenario."
-    },
     "business_growth": {
       "mode": "simulated",
       "distribution": "uniform",
@@ -27,10 +20,17 @@
       "mode": "simulated",
       "distribution": "uniform",
       "random_seed": 20260601,
-      "alpha_age_min": 0.08,
-      "alpha_age_max": 0.25,
+      "alpha_age_min": 0.01,
+      "alpha_age_max": 0.03,
       "epsilon_age_fallback": "alpha_age",
       "source": "AC-unit-level simulated scenario values for model Section 5.2 alpha_z_age because measured AC aging and efficiency degradation data are not available."
+    },
+    "existing_cooling_redundancy": {
+      "enabled": true,
+      "old_ac_factor": 1.20,
+      "chiller_factor": 1.20,
+      "tower_factor": 1.20,
+      "source": "Existing AC/chiller/tower nominal capacities are calibrated as original design redundancy so the aged old cooling system still covers business-growth peak demand, while the remaining margin shrinks."
     }
   },
   "decision_bounds": {
@@ -65,16 +65,40 @@
   },
   "solver": {
     "gurobi": {
-      "time_limit_seconds": 120,
-      "mip_gap": 0.01,
-      "threads": 0
+      "time_limit_seconds": 45,
+      "mip_gap": 0.05,
+      "threads": 1,
+      "mip_focus": 1,
+      "nodefile_start_gb": 0.5,
+      "numeric_focus": 1,
+      "output_flag": 0
     },
     "nsga2": {
-      "population_size": 96,
-      "generations": 80,
+      "population_size": 72,
+      "generations": 40,
       "crossover_probability": 0.9,
       "mutation_probability": 0.15,
       "random_seed": 42
+    },
+    "parallel": {
+      "enabled": true,
+      "workers": 2,
+      "strict": false,
+      "chunksize": 1,
+      "gurobi_threads_per_worker": 1
+    },
+    "inner": {
+      "build_mode": "template_reuse",
+      "warm_start": {
+        "enabled": true,
+        "capacity_bucket_kw": 100,
+        "neighbor_bucket_radius": 1,
+        "max_entries": 512
+      },
+      "persistent_template": {
+        "enabled": true,
+        "strict": false
+      }
     }
   },
   "convergence": {
@@ -86,6 +110,13 @@
       1.1,
       1.1
     ]
+  },
+  "benchmarks": {
+    "aggressive_config_id": 6,
+    "aggressive_bess_hours": 0.0,
+    "aggressive_tes_hours": 0.0,
+    "aggressive_tower_multiplier": 1.35,
+    "source": "Baseline 1 keeps existing AC/chiller/tower without retrofit after calibrating existing redundancy to cover business-growth and AC-aging peak cooling demand; Baseline 2 applies configuration 6 to all AC/rack groups with peak-based capacity sizing; Proposed uses the Pareto knee solution from refined NSGA-II planning."
   },
   "technology": {
     "configurations": {
@@ -102,6 +133,15 @@
       "cop_chiller": 3.0,
       "ac_fan_kw_per_kw": 0.2137
     },
+    "thermal": {
+      "hotspot_constraints_enabled": false,
+      "rack_temp_max_c": 27.0,
+      "old_supply_temp_c": 24.0,
+      "new_supply_temp_c": 22.0,
+      "aux_supply_temp_c": 23.0,
+      "beta_air_c_per_kw": 0.02,
+      "source": "Hotspot constraints are temporarily disabled for full-run optimization; max_theta_c remains exported as a diagnostic and the switch can be re-enabled for sensitivity checks."
+    },
     "cop_ashp": 3.2,
     "cop_wshp": 4.0,
     "tower_kw_per_kw_heat": 0.015,
@@ -117,22 +157,24 @@
   "economics": {
     "discount_rate": 0.06,
     "project_life_years": 15,
-    "heat_credit_yuan_per_kwh": 0.2,
+    "heat_credit_yuan_per_kwh": 0.223,
     "capex_yuan_per_kw": {
-      "ac_new": 900,
+      "ac_new": 2000,
       "rdhx": 1200,
-      "cdu": 1300,
-      "ashp": 1200,
-      "wshp": 1200,
+      "cdu": 900,
+      "cold_plate": 2500,
+      "ashp": 2600,
+      "wshp": 3200,
       "chiller": 1000,
       "tower": 220,
       "tes": 180,
-      "bess": 330
+      "bess": 1100
     },
     "fixed_om_yuan_per_kw_year": {
       "ac_new": 0,
       "rdhx": 0,
       "cdu": 0,
+      "cold_plate": 0,
       "ashp": 0,
       "wshp": 0,
       "chiller": 0,
@@ -140,6 +182,7 @@
       "tes": 0,
       "bess": 0
     },
+    "retrofit_fixed_yuan_unit": "yuan_per_rack",
     "retrofit_fixed_yuan": {
       "0": 0,
       "1": 5000,
@@ -147,49 +190,51 @@
       "3": 6200,
       "4": 9000,
       "5": 8500,
-      "6": 10500
+      "6": 15000
     }
   },
   "carbon": {
     "allow_negative_operational_carbon": false,
-    "heat_displacement_kg_per_kwh": 0.11,
+    "heat_displacement_kg_per_kwh": 0.20,
     "embodied_kg_per_kw": {
-      "ac_new": 80,
-      "rdhx": 120,
-      "cdu": 5,
-      "ashp": 12,
-      "wshp": 12,
-      "chiller": 130,
-      "tower": 5,
-      "tes": 10,
-      "bess": 90
+      "ac_new": 45,
+      "rdhx": 28,
+      "cdu": 20,
+      "cold_plate": 6,
+      "ashp": 70,
+      "wshp": 80,
+      "chiller": 60,
+      "tower": 15,
+      "tes": 12,
+      "bess": 110
     },
+    "retrofit_fixed_kg_unit": "kgCO2_per_rack",
     "retrofit_fixed_kg": {
       "0": 0,
-      "1": 400,
+      "1": 72,
       "2": 520,
-      "3": 500,
-      "4": 700,
-      "5": 650,
-      "6": 820
+      "3": 93.6,
+      "4": 126,
+      "5": 117,
+      "6": 150
     }
   },
   "weight": {
-    "floor_limit_kg_per_m2": 800,
+    "floor_limit_kg_per_m2": 1200,
     "zone_floor_area_m2": 12,
-    "rack_static_kg": 900,
+    "rack_static_kg": 1500,
     "equipment_kg_per_kw": {
       "ac_new": 5,
       "rdhx": 6,
-      "cdu": 5,
+      "cdu": 1,
       "bess": 10,
       "tes": 4
     },
-    "soft_constraint": {
+    "hard_constraint": {
       "enabled": true,
-      "cost_penalty_yuan_per_kg_year": 500,
-      "carbon_penalty_kg_per_kg_year": 0,
-      "source": "Soft penalty for exceeding floor load-bearing margin; replace with project-specific structural reinforcement cost and embodied carbon if available."
+      "abs_tolerance_kg": 0.000001,
+      "relative_tolerance": 0.000000001,
+      "source": "Hard load-bearing repair and screening constraint; tolerance only prevents floating-point boundary misclassification."
     }
   },
   "assumptions": {

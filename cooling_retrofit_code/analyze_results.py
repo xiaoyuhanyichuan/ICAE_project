@@ -29,6 +29,58 @@ def _format_percent(value: float) -> str:
     return f"{100.0 * number:.2f}%"
 
 
+def _format_years(value: float) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "N/A"
+    if np.isposinf(number):
+        return "not recoverable"
+    if not np.isfinite(number):
+        return "N/A"
+    return f"{number:,.2f} years"
+
+
+def _format_change_percent(current: Any, baseline: Any, *, lower_is_better: bool = True) -> str:
+    try:
+        current_number = float(current)
+        baseline_number = float(baseline)
+    except (TypeError, ValueError):
+        return "N/A"
+    if not np.isfinite(current_number) or not np.isfinite(baseline_number) or abs(baseline_number) < 1.0e-12:
+        return "N/A"
+    if lower_is_better:
+        change = (baseline_number - current_number) / baseline_number
+    else:
+        change = (current_number - baseline_number) / baseline_number
+    direction = "降低" if lower_is_better and change >= 0 else "增加"
+    if not lower_is_better:
+        direction = "提高" if change >= 0 else "降低"
+    return f"{direction} {abs(change) * 100.0:.2f}%"
+
+
+def _format_change_points(current: Any, baseline: Any, *, higher_is_better: bool = True) -> str:
+    try:
+        current_number = float(current)
+        baseline_number = float(baseline)
+    except (TypeError, ValueError):
+        return "N/A"
+    if not np.isfinite(current_number) or not np.isfinite(baseline_number):
+        return "N/A"
+    change = current_number - baseline_number if higher_is_better else baseline_number - current_number
+    direction = "提高" if change >= 0 else "降低"
+    return f"{direction} {abs(change) * 100.0:.2f} 个百分点"
+
+
+def _format_years_cn(value: Any) -> str:
+    text = _format_years(value)
+    if text == "not recoverable":
+        return "无法追平"
+    if text == "N/A":
+        return text
+    return text.replace(" years", " 年")
+
+
 def _safe_json(value: Any) -> Any:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
@@ -268,6 +320,141 @@ def _spatial_visualization_lines(output: Path) -> list[str]:
     return lines
 
 
+def _benchmark_scenario_label(row: pd.Series) -> str:
+    key = str(row.get("scenario_key", ""))
+    labels = {
+        "baseline_1_no_retrofit": "Baseline 1：不改造（既有冗余）",
+        "baseline_2_aggressive_retrofit": "Baseline 2：整体激进改造",
+        "proposed_refined_knee": "本文方案：精细化改造",
+    }
+    return labels.get(key, str(row.get("scenario_label", key or "N/A")))
+
+
+def _benchmark_comparison_lines(output: Path) -> list[str]:
+    comparison_csv = output / "benchmark_comparison.csv"
+    comparison_plot = output / "figures" / "benchmark_comparison.png"
+    if not comparison_csv.exists():
+        return ["- 尚未生成三方案对比实验结果。"]
+
+    lines = [
+        f"- 三方案对比数据表：`{comparison_csv}`",
+    ]
+    if comparison_plot.exists():
+        lines.extend(
+            [
+                f"- 三方案对比图：`{comparison_plot}`",
+                f"![三方案对比图]({comparison_plot})",
+            ]
+        )
+
+    try:
+        comparison = pd.read_csv(comparison_csv)
+    except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+        return lines
+    if comparison.empty:
+        lines.append("- 三方案对比数据表为空。")
+        return lines
+
+    lines.extend(
+        [
+            "",
+            "| 方案 | 可行性 | TLCC (yuan/year) | TCE (kgCO2/year) | 运行成本 (yuan/year) | 运营碳 (kgCO2/year) | 余热回收率 | PUE |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for _, row in comparison.iterrows():
+        lines.append(
+            "| "
+            f"{_benchmark_scenario_label(row)} | "
+            f"{row.get('feasible', 'N/A')} | "
+            f"{_format_number(row.get('tlcc'))} | "
+            f"{_format_number(row.get('tce'))} | "
+            f"{_format_number(row.get('operational_cost_yuan'))} | "
+            f"{_format_number(row.get('operational_carbon_kg'))} | "
+            f"{_format_percent(row.get('waste_heat_recovery_rate'))} | "
+            f"{_format_number(row.get('pue'))} |"
+        )
+
+    proposed = comparison[comparison["scenario_key"].astype(str) == "proposed_refined_knee"]
+    baseline_1 = comparison[comparison["scenario_key"].astype(str) == "baseline_1_no_retrofit"]
+    baseline_2 = comparison[comparison["scenario_key"].astype(str) == "baseline_2_aggressive_retrofit"]
+    if not proposed.empty:
+        proposed_row = proposed.iloc[0]
+        references = [
+            ("Baseline 1（不改造/既有冗余）", baseline_1.iloc[0] if not baseline_1.empty else None),
+            ("Baseline 2（整体激进改造）", baseline_2.iloc[0] if not baseline_2.empty else None),
+        ]
+        lines.extend(
+            [
+                "",
+                "| 对比对象 | TLCC | TCE | 运行成本 | 运营碳 | 余热回收率 |",
+                "| --- | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for label, ref_row in references:
+            if ref_row is None:
+                continue
+            lines.append(
+                "| 本文方案相对 "
+                f"{label} | "
+                f"{_format_change_percent(proposed_row.get('tlcc'), ref_row.get('tlcc'))} | "
+                f"{_format_change_percent(proposed_row.get('tce'), ref_row.get('tce'))} | "
+                f"{_format_change_percent(proposed_row.get('operational_cost_yuan'), ref_row.get('operational_cost_yuan'))} | "
+                f"{_format_change_percent(proposed_row.get('operational_carbon_kg'), ref_row.get('operational_carbon_kg'))} | "
+                f"{_format_change_points(proposed_row.get('waste_heat_recovery_rate'), ref_row.get('waste_heat_recovery_rate'))} |"
+            )
+
+    if {
+        "fixed_cost_payback_years",
+        "embodied_carbon_payback_years",
+    }.issubset(comparison.columns):
+        lines.append("")
+        lines.append(
+            "- 投资追平年限均以 Baseline 1 为参照；固定成本增量和隐含碳增量由年化 TLCC/TCE "
+            "结果层扣除年度运行成本/运营碳后估算。"
+        )
+
+    for _, row in comparison.iterrows():
+        feasible = str(row.get("feasible", "N/A"))
+        metric_text = ""
+        metric_parts = []
+        if "pue" in comparison.columns:
+            metric_parts.append(f"PUE={_format_number(row.get('pue'))}")
+        if "operational_cost_yuan" in comparison.columns:
+            metric_parts.append(f"运行成本={_format_number(row.get('operational_cost_yuan'), 'yuan/year')}")
+        if "operational_carbon_kg" in comparison.columns:
+            metric_parts.append(f"运营碳={_format_number(row.get('operational_carbon_kg'), 'kgCO2/year')}")
+        if "waste_heat_recovery_rate" in comparison.columns:
+            metric_parts.append(f"余热回收率={_format_percent(row.get('waste_heat_recovery_rate'))}")
+        if "operational_cost_saving_vs_baseline_yuan_per_year" in comparison.columns:
+            metric_parts.append(
+                "相对 B1 运行成本节省="
+                f"{_format_number(row.get('operational_cost_saving_vs_baseline_yuan_per_year'), 'yuan/year')}"
+            )
+        if "operational_carbon_saving_vs_baseline_kg_per_year" in comparison.columns:
+            metric_parts.append(
+                "相对 B1 运营碳节省="
+                f"{_format_number(row.get('operational_carbon_saving_vs_baseline_kg_per_year'), 'kgCO2/year')}"
+            )
+        if "fixed_cost_payback_years" in comparison.columns:
+            metric_parts.append(f"固定成本追平年限={_format_years_cn(row.get('fixed_cost_payback_years'))}")
+        if "embodied_carbon_payback_years" in comparison.columns:
+            metric_parts.append(
+                f"隐含碳追平年限={_format_years_cn(row.get('embodied_carbon_payback_years'))}"
+            )
+        if metric_parts:
+            metric_text = ", " + ", ".join(metric_parts)
+        lines.append(
+            "- "
+            f"{row.get('scenario_key', 'N/A')} ({_benchmark_scenario_label(row)}): "
+            f"可行={feasible}, "
+            f"TLCC={_format_number(row.get('tlcc'), 'yuan/year')}, "
+            f"TCE={_format_number(row.get('tce'), 'kgCO2/year')}"
+            f"{metric_text}"
+        )
+    return lines
+
+
 def _assumption_lines(config: dict) -> list[str]:
     assumptions = config.get("assumptions", {})
     if not assumptions:
@@ -280,6 +467,114 @@ def _assumption_lines(config: dict) -> list[str]:
         description = detail.get("description", "无补充说明")
         lines.append(f"- `{name}`：source={source}，confidence={confidence}，{description}")
     return lines
+
+
+def _runtime_acceleration_lines(all_evaluations: pd.DataFrame) -> list[str]:
+    if all_evaluations.empty:
+        return ["- 暂无评估记录。"]
+
+    lines: list[str] = []
+
+    if "build_mode" in all_evaluations:
+        build_modes = (
+            all_evaluations["build_mode"]
+            .fillna("")
+            .astype(str)
+            .replace("", "unknown")
+            .value_counts()
+        )
+        if not build_modes.empty:
+            modes = "；".join(f"{mode}: {count}" for mode, count in build_modes.items())
+            lines.append(f"- build mode 分布：{modes}")
+
+    if "parallel_fallback" in all_evaluations:
+        fallback = _bool_series(all_evaluations["parallel_fallback"], all_evaluations.index)
+        lines.append(f"- parallel fallback rate: {_format_percent(float(fallback.mean()))}")
+        if bool(fallback.any()) and "parallel_fallback_reason" in all_evaluations:
+            reasons = (
+                all_evaluations.loc[fallback, "parallel_fallback_reason"]
+                .fillna("")
+                .astype(str)
+                .replace("", "unknown")
+                .value_counts()
+            )
+            reason_text = "; ".join(f"{reason}: {count}" for reason, count in reasons.items())
+            lines.append(f"- parallel fallback reasons: {reason_text}")
+
+    for column, label in (
+        ("parallel_workers", "parallel workers"),
+        ("parallel_chunksize", "parallel chunksize"),
+        ("gurobi_nodefile_start_gb", "Gurobi NodefileStart GB"),
+        ("gurobi_mip_focus", "Gurobi MIPFocus"),
+        ("gurobi_numeric_focus", "Gurobi NumericFocus"),
+        ("gurobi_output_flag", "Gurobi OutputFlag"),
+    ):
+        if column not in all_evaluations:
+            continue
+        values = _finite_numeric(all_evaluations[column])
+        if not values.empty:
+            unique_values = sorted(set(float(value) for value in values))
+            shown = ", ".join(f"{value:g}" for value in unique_values[:5])
+            lines.append(f"- {label}: {shown}")
+
+    timing_fields = [
+        ("inner_build_total_s", "平均 fresh 建模/模板更新总耗时"),
+        ("inner_update_s", "平均模板更新时间"),
+        ("inner_optimize_s", "平均 Gurobi 求解时间"),
+        ("template_build_once_s", "平均模板首次构建耗时"),
+    ]
+    for column, label in timing_fields:
+        if column not in all_evaluations:
+            continue
+        values = _finite_numeric(all_evaluations[column])
+        if not values.empty:
+            lines.append(f"- {label}：{values.mean():.3f} s")
+
+    if "warm_start_hit" in all_evaluations:
+        hits = _bool_series(all_evaluations["warm_start_hit"], all_evaluations.index)
+        lines.append(f"- warm start 命中率：{_format_percent(float(hits.mean()))}")
+
+    if "warm_start_values_applied" in all_evaluations:
+        applied = _finite_numeric(all_evaluations["warm_start_values_applied"])
+        if not applied.empty:
+            positive = float((applied > 0).mean())
+            lines.append(
+                f"- warm start 实际写入率：{_format_percent(positive)}；"
+                f"平均写入变量数：{applied.mean():.1f}"
+            )
+
+    warm_counter_cols = ("warm_start_exact_hits", "warm_start_neighbor_hits", "warm_start_misses")
+    if all(column in all_evaluations for column in warm_counter_cols):
+        counters = {
+            column: _finite_numeric(all_evaluations[column])
+            for column in warm_counter_cols
+        }
+        if all(not values.empty for values in counters.values()):
+            exact = int(counters["warm_start_exact_hits"].max())
+            neighbor = int(counters["warm_start_neighbor_hits"].max())
+            misses = int(counters["warm_start_misses"].max())
+            lines.append(
+                f"- warm start exact/neighbor/miss: exact={exact}, "
+                f"neighbor={neighbor}, miss={misses}"
+            )
+
+    if "template_reuse_hit" in all_evaluations:
+        hits = _bool_series(all_evaluations["template_reuse_hit"], all_evaluations.index)
+        lines.append(f"- template reuse 命中率：{_format_percent(float(hits.mean()))}")
+
+    if "persistent_template_backend" in all_evaluations:
+        backends = (
+            all_evaluations["persistent_template_backend"]
+            .fillna("")
+            .astype(str)
+            .replace("", "none")
+            .value_counts()
+        )
+        if not backends.empty:
+            backend_text = "；".join(f"{backend}: {count}" for backend, count in backends.items())
+            lines.append(f"- persistent template backend：{backend_text}")
+
+    return lines or ["- 暂无求解加速诊断字段。"]
 
 
 def write_report(
@@ -304,7 +599,6 @@ def write_report(
     generation_values = _finite_numeric(all_evaluations["generation"]) if "generation" in all_evaluations else pd.Series(dtype=float)
     nsga_cfg = config.get("solver", {}).get("nsga2", {})
     typical_cfg = config.get("typical_days", {})
-    heat_scaling = config.get("scenario", {}).get("heat_demand_scaling", {})
     repaired_count = _changed_by_repair(all_evaluations)
     convergence_summary = _read_convergence_summary(output)
 
@@ -324,21 +618,14 @@ def write_report(
         "## 2. 模型与求解口径",
         "",
         "- 方法论继承原研究问题：外层 NSGA-II 规划搜索，repair/screening 预筛查，内层 Gurobi MILP 运行调度，最后从全部历史可行解筛选 Pareto 前沿。",
-        "- 当前代码口径已同步：RDHX 链路不再设置辅助风冷容量；BESS 不再拆分功率容量和能量容量；供热需求为硬约束，不再设置未供热松弛罚金。",
+        "- 当前代码口径已同步：RDHX 链路不再设置辅助风冷容量；BESS 不再拆分功率容量和能量容量；供热输出以原始供热需求为可消纳上限，不再设置未供热松弛罚金。",
         "- RDHX 按可吸收其负责区域 100% IT 热量建模；未进入 WSHP 的 RDHX 热量进入 Chiller。",
         "- BESS 仅使用整体容量 `cap_bess`，充放电功率上限由 `technology.bess.c_rate_per_hour` 派生。",
         f"- 典型日：K={typical_cfg.get('k', 'N/A')}；append_peak_day={typical_cfg.get('append_peak_day', 'N/A')}。",
         f"- NSGA-II：population_size={nsga_cfg.get('population_size', 'N/A')}；generations={nsga_cfg.get('generations', 'N/A')}；mutation_probability={nsga_cfg.get('mutation_probability', 'N/A')}。",
     ]
 
-    if heat_scaling:
-        lines.extend(
-            [
-                f"- 供热需求缩放：enabled={heat_scaling.get('enabled', False)}；method={heat_scaling.get('method', 'N/A')}；target_peak_fraction_of_it_load={heat_scaling.get('target_peak_fraction_of_it_load', 'N/A')}。",
-                f"- 缩放原因：{heat_scaling.get('source', '未说明')}",
-            ]
-        )
-
+    lines.extend(["", "## 2.1 求解加速统计", "", *_runtime_acceleration_lines(all_evaluations)])
     lines.extend(["", "## 3. 收敛性分析", "", *_convergence_lines(convergence_summary)])
     lines.extend(["", "## 4. 模型-代码同步提示", "", "- 未检测到 RDHX 辅助风冷、BESS 双容量或供热松弛罚金字段。"])
 
@@ -384,15 +671,19 @@ def write_report(
 
     lines.extend(["", "## 7. 机房空间可视化", "", *_spatial_visualization_lines(output)])
 
+    lines.extend(["", "## 8. 三方案对比实验", "", *_benchmark_comparison_lines(output)])
+
     figures = output / "figures"
     convergence = output / "convergence"
     lines.extend(
         [
             "",
-            "## 8. 输出文件索引",
+            "## 9. 输出文件索引",
             "",
             f"- 全部历史评估：`{output / 'all_evaluations.csv'}`",
             f"- Pareto 解集：`{output / 'pareto_solutions.csv'}`",
+            f"- 三方案对比：`{output / 'benchmark_comparison.csv'}`",
+            f"- 三方案对比图：`{figures / 'benchmark_comparison.png'}`",
             f"- Pareto 前沿图：`{figures / 'pareto.png'}`",
             f"- Pareto 决策变量分布：`{figures / 'pareto_solution_distribution.png'}`",
             f"- 机房空间布局图：`{figures / 'room_layout_knee_solution_room*.png'}`",
@@ -402,14 +693,14 @@ def write_report(
             f"- Pareto 详情目录：`{output / 'pareto_details'}`",
             f"- 本报告：`{report_path}`",
             "",
-            "## 9. 参数来源与假设",
+            "## 10. 参数来源与假设",
             "",
             *_assumption_lines(config),
             "",
-            "## 10. 后续审核重点",
+            "## 11. 后续审核重点",
             "",
             "- 正式论文实验前，应继续替换成本、隐含碳、重量、寿命、FOM/VOM 等占位参数。",
-            "- 当前供热需求已按 IT 余热量级缩放，供热侧结论应解释为余热消纳场景，不能直接外推到原始 8 MW 建筑供热峰值。",
+            "- 当前供热需求使用原始输入值；供热侧结论表示余热可利用/可消纳量，不代表必须满足建筑完整供热需求。",
         ]
     )
 

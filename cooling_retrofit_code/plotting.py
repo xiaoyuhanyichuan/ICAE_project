@@ -147,6 +147,64 @@ def save_pareto_distribution_plot(pareto: pd.DataFrame, output_dir: str | Path, 
     return plot_path
 
 
+def save_benchmark_comparison_plot(comparison: pd.DataFrame, output_dir: str | Path) -> Path | None:
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import PercentFormatter
+
+    required = {"scenario_key", "scenario_label", "tlcc", "tce"}
+    if comparison.empty or not required.issubset(comparison.columns):
+        return None
+
+    frame = comparison.copy()
+    panel_specs = [
+        ("tlcc", "Annualized Cost", "TLCC (yuan/year)", "#1f77b4", None),
+        ("tce", "Annualized Carbon", "TCE (kgCO2/year)", "#d95f02", None),
+        ("pue", "Power Usage Effectiveness", "PUE", "#2ca02c", None),
+        ("operational_cost_yuan", "Operating Cost", "yuan/year", "#9467bd", None),
+        ("operational_carbon_kg", "Operating Carbon", "kgCO2/year", "#8c564b", None),
+        ("waste_heat_recovery_rate", "Waste Heat Recovery", "recovery rate", "#17becf", "percent"),
+    ]
+    for column, *_ in panel_specs:
+        if column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.replace([np.inf, -np.inf], np.nan).dropna(subset=["tlcc", "tce"])
+    if frame.empty:
+        return None
+    available_specs = [
+        spec for spec in panel_specs if spec[0] in frame.columns and frame[spec[0]].notna().any()
+    ]
+    if len(available_specs) < 2:
+        return None
+
+    figures_dir = Path(output_dir) / "figures"
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    plot_path = figures_dir / "benchmark_comparison.png"
+
+    labels = frame["scenario_label"].astype(str).tolist()
+    x = np.arange(len(frame))
+    panel_count = len(available_specs)
+    ncols = min(3, panel_count)
+    nrows = int(np.ceil(panel_count / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.2 * ncols, 4.5 * nrows))
+    axes = np.asarray(axes).reshape(-1)
+    for ax, (column, title, ylabel, color, style) in zip(axes, available_specs):
+        ax.bar(x, frame[column], color=color, alpha=0.82)
+        ax.set_title(title)
+        ax.set_ylabel(ylabel)
+        if style == "percent":
+            ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0))
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=25, ha="right")
+        ax.grid(axis="y", alpha=0.22)
+    for ax in axes[panel_count:]:
+        ax.axis("off")
+    fig.suptitle("Baseline vs Refined Retrofit")
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=180)
+    plt.close(fig)
+    return plot_path
+
+
 def pareto_distribution_frame(pareto: pd.DataFrame, config: dict) -> pd.DataFrame:
     rows: list[dict[str, float]] = []
     configurations = config.get("technology", {}).get("configurations", {})

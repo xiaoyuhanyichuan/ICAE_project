@@ -11,6 +11,7 @@ planning model only.
 | `Cap_z^{AC,new}` | `cap_ac_new[z]` | New AC capacity by zone. |
 | `Cap_z^{RDHX}` | `cap_rdhx[z]` | RDHX capacity by zone. |
 | `Cap_z^{CDU}` | `cap_cdu[z]` | CDU capacity by zone. |
+| `Cap_z^{CP}` | derived from `cap_cdu[z]` when `p_z=1` | Cold-plate IT-side retrofit capacity. It is not an independent outer variable. |
 | `Cap^{BESS}` | `cap_bess` | Integrated BESS capacity; cost and embodied carbon are not split into power and energy parts. |
 | WSHP capacity | `cap_wshp` | System-level WSHP heat recovery capacity. |
 | Added chiller capacity | `delta_cap_chiller` | Incremental chiller capacity above existing capacity. |
@@ -50,3 +51,18 @@ Dispatch result columns include:
 AC, RDHX, and CDU electric power are not separate dispatch result columns in
 the current implementation. They are accounted for inside `p_grid_kw` by
 multiplying the relevant heat flows by their configured electric coefficients.
+
+## Cold-Plate/CDU CAPEX and Embodied Carbon
+
+The cold-plate/CDU retrofit chain is costed as:
+
+`Cap_z^{CDU} * C^{CDU} + Cap_z^{CP} * C^{cold_plate} + rack_count_z * C_k^{retro,fixed}`.
+
+The embodied-carbon calculation follows the same decomposition:
+
+`Cap_z^{CDU} * EI^{CDU} + Cap_z^{CP} * EI^{cold_plate} + rack_count_z * EI_k^{retro,fixed}`.
+
+In the current code, `Cap_z^{CP}` is derived from the cold-plate planning
+capacity and set equal to `cap_cdu[z]` for cold-plate configurations. Default
+values are `C^{cold_plate}=2500 yuan/kW_IT` and
+`EI^{cold_plate}=6 kgCO2e/kW_IT`.

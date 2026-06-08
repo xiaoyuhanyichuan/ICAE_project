@@ -3,7 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 from typing import Any
+import zipfile
+import xml.etree.ElementTree as ET
 
 import numpy as np
 import pandas as pd
@@ -59,6 +62,129 @@ def _read_csv(data_dir: Path, name: str) -> pd.DataFrame:
     if last_error is not None:
         raise last_error
     return pd.read_csv(path)
+
+
+def _read_xlsx(data_dir: Path, name: str) -> pd.DataFrame:
+    path = data_dir / name
+    if not path.exists():
+        raise FileNotFoundError(f"Missing required data file: {path}")
+    try:
+        return pd.read_excel(path)
+    except ImportError:
+        return _read_xlsx_with_stdlib(path)
+
+
+def _read_xlsx_with_stdlib(path: Path) -> pd.DataFrame:
+    ns = {
+        "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+        "rel": "http://schemas.openxmlformats.org/package/2006/relationships",
+    }
+    with zipfile.ZipFile(path) as archive:
+        shared_strings: list[str] = []
+        if "xl/sharedStrings.xml" in archive.namelist():
+            root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+            for item in root.findall("main:si", ns):
+                text_parts = [node.text or "" for node in item.findall(".//main:t", ns)]
+                shared_strings.append("".join(text_parts))
+
+        sheet_name = _first_xlsx_sheet_name(archive)
+        root = ET.fromstring(archive.read(sheet_name))
+
+    rows: list[list[Any]] = []
+    for row in root.findall(".//main:sheetData/main:row", ns):
+        values: list[Any] = []
+        expected_index = 0
+        for cell in row.findall("main:c", ns):
+            ref = cell.attrib.get("r")
+            if ref:
+                col_index = _xlsx_column_index(ref)
+                while expected_index < col_index:
+                    values.append(None)
+                    expected_index += 1
+            values.append(_xlsx_cell_value(cell, shared_strings, ns))
+            expected_index += 1
+        rows.append(values)
+
+    if not rows:
+        return pd.DataFrame()
+    header = [str(value).strip() if value is not None else "" for value in rows[0]]
+    width = len(header)
+    data = [row + [None] * (width - len(row)) for row in rows[1:]]
+    return pd.DataFrame([row[:width] for row in data], columns=header)
+
+
+def _first_xlsx_sheet_name(archive: zipfile.ZipFile) -> str:
+    names = archive.namelist()
+    workbook_name = "xl/workbook.xml"
+    rels_name = "xl/_rels/workbook.xml.rels"
+    if workbook_name in names and rels_name in names:
+        ns = {
+            "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+            "rel": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+            "pkg": "http://schemas.openxmlformats.org/package/2006/relationships",
+        }
+        workbook = ET.fromstring(archive.read(workbook_name))
+        first_sheet = workbook.find("main:sheets/main:sheet", ns)
+        if first_sheet is not None:
+            rel_id = first_sheet.attrib.get(f"{{{ns['rel']}}}id")
+            rels = ET.fromstring(archive.read(rels_name))
+            for rel in rels.findall("pkg:Relationship", ns):
+                if rel.attrib.get("Id") == rel_id:
+                    target = rel.attrib["Target"].lstrip("/")
+                    return target if target.startswith("xl/") else f"xl/{target}"
+    sheet_names = sorted(name for name in names if name.startswith("xl/worksheets/sheet"))
+    if not sheet_names:
+        raise ValueError(f"No worksheet found in {archive.filename}")
+    return sheet_names[0]
+
+
+def _xlsx_column_index(cell_ref: str) -> int:
+    match = re.match(r"([A-Z]+)", cell_ref)
+    if not match:
+        return 0
+    index = 0
+    for char in match.group(1):
+        index = index * 26 + ord(char) - ord("A") + 1
+    return index - 1
+
+
+def _xlsx_cell_value(
+    cell: ET.Element,
+    shared_strings: list[str],
+    ns: dict[str, str],
+) -> Any:
+    cell_type = cell.attrib.get("t")
+    if cell_type == "inlineStr":
+        return "".join(node.text or "" for node in cell.findall(".//main:t", ns))
+    value_node = cell.find("main:v", ns)
+    if value_node is None:
+        return None
+    value = value_node.text or ""
+    if cell_type == "s":
+        return shared_strings[int(value)]
+    return value
+
+
+def _read_table(data_dir: Path, name: str) -> pd.DataFrame:
+    suffix = Path(name).suffix.lower()
+    if suffix == ".xlsx":
+        return _read_xlsx(data_dir, name)
+    return _read_csv(data_dir, name)
+
+
+def _configured_data_file(
+    data_dir: Path,
+    config: dict[str, Any],
+    key: str,
+    candidates: tuple[str, ...],
+) -> str:
+    configured = config.get("paths", {}).get(key)
+    names = (configured, *candidates) if configured else candidates
+    for name in names:
+        if name and (data_dir / name).exists():
+            return name
+    missing = ", ".join(str(name) for name in names if name)
+    raise FileNotFoundError(f"None of the configured data files exist in {data_dir}: {missing}")
 
 
 def _timestamp_col(df: pd.DataFrame) -> str:
@@ -132,10 +258,44 @@ def _with_canonical_slot_timestamp(
     return out
 
 
+def _with_price_hour_timestamp(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if {"Data", "Ora"}.issubset(out.columns):
+        date = pd.to_datetime(out["Data"].astype(str).str.strip(), format="%d/%m/%Y")
+        hour = pd.to_numeric(out["Ora"], errors="raise").astype(int)
+        if len(out) == 8760 and date.min().year == 2025 and date.max().year == 2025:
+            # Italian market files can include a DST hour 25 and omit another civil-clock
+            # hour while still providing 8760 market intervals. The model uses canonical
+            # 2025 dispatch slots, so keep the market row order and align it to those slots.
+            out["timestamp_hour_utc"] = pd.Timestamp(
+                "2025-01-01 00:00:00+00:00"
+            ) + pd.to_timedelta(np.arange(len(out)), unit="h")
+        else:
+            if not hour.between(1, 24).all():
+                raise ValueError("Italian PUN price Ora column must span hourly values 1..24")
+            out["timestamp_hour_utc"] = pd.to_datetime(
+                date + pd.to_timedelta(hour - 1, unit="h"),
+                utc=True,
+            )
+        return _filter_2025_hourly_series(out, "price")
+    return _with_canonical_slot_timestamp(
+        out,
+        ("timestamp_local",),
+        source_name="price",
+        require_preferred_column=True,
+    )
+
+
 def _with_carbon_hour_timestamp(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+    if "datetime" in out.columns and "carbonIntensity" in out.columns:
+        out["timestamp_hour_utc"] = pd.to_datetime(out["datetime"], utc=True).dt.floor("h")
+        out["carbon_kg_per_kwh"] = pd.to_numeric(
+            out["carbonIntensity"], errors="raise"
+        ) / 1000.0
+        return _filter_2025_hourly_series(out, "carbon")
     if "hour_of_year" not in out.columns:
-        raise ValueError("Carbon data must include hour_of_year")
+        raise ValueError("Carbon data must include hour_of_year or datetime/carbonIntensity")
     hour_of_year = pd.to_numeric(out["hour_of_year"], errors="raise")
     if len(out) != 8760:
         raise ValueError(f"Carbon data must have exactly 8760 rows, found {len(out)}")
@@ -147,6 +307,20 @@ def _with_carbon_hour_timestamp(df: pd.DataFrame) -> pd.DataFrame:
         hour_of_year - 1, unit="h"
     )
     return out
+
+
+def _filter_2025_hourly_series(df: pd.DataFrame, source_name: str) -> pd.DataFrame:
+    out = df.copy()
+    start = pd.Timestamp("2025-01-01 00:00:00+00:00")
+    end = pd.Timestamp("2025-12-31 23:00:00+00:00")
+    out = out[
+        (out["timestamp_hour_utc"] >= start) & (out["timestamp_hour_utc"] <= end)
+    ].copy()
+    if len(out) != 8760:
+        raise ValueError(f"{source_name} data must have exactly 8760 rows for 2025, found {len(out)}")
+    if not out["timestamp_hour_utc"].is_unique:
+        raise ValueError(f"{source_name} timestamp_hour_utc values must be unique")
+    return out.sort_values("timestamp_hour_utc").reset_index(drop=True)
 
 
 def _expected_heating_datetime_labels() -> pd.Series:
@@ -458,6 +632,16 @@ def _old_ac_capacity_config(config: dict[str, Any]) -> dict[str, float]:
     return {}
 
 
+def _existing_old_ac_redundancy_factor(config: dict[str, Any]) -> float:
+    scenario = config.get("scenario", {})
+    redundancy = scenario.get("existing_cooling_redundancy", {})
+    if isinstance(redundancy, dict):
+        value = redundancy.get("old_ac_factor", redundancy.get("factor", 1.0))
+    else:
+        value = 1.0
+    return max(1.0, float(value))
+
+
 def _apply_business_growth_and_ac_aging(
     hourly: pd.DataFrame,
     rack_metadata: pd.DataFrame,
@@ -470,7 +654,6 @@ def _apply_business_growth_and_ac_aging(
     if not rack_cols:
         return pd.concat([out, pd.DataFrame(extra_columns, index=out.index)], axis=1).copy()
 
-    baseline_zone_peak = _zone_peak_from_rack_columns(out, rack_metadata, rack_cols)
     years = _elapsed_years_for_growth(out, config)
     extra_columns["it_load_kw_base"] = pd.to_numeric(out["it_load_kw"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
     scenario_by_rack = scenario_table.set_index("rack_id")
@@ -484,17 +667,23 @@ def _apply_business_growth_and_ac_aging(
         out[col] = np.minimum(base * np.power(1.0 + rho, years), qmax)
 
     out["it_load_kw"] = out[rack_cols].sum(axis=1)
+    grown_zone_peak = _zone_peak_from_rack_columns(out, rack_metadata, rack_cols)
     old_ac_config = _old_ac_capacity_config(config)
+    old_ac_redundancy = _existing_old_ac_redundancy_factor(config)
     tech = config.get("technology", {})
     fitted = tech.get("fitted", {})
     e_air_base = float(fitted.get("ac_fan_kw_per_kw", tech.get("ac_fan_kw_per_kw", 0.2137)))
     for zone, group in scenario_table.groupby("zone_id", sort=True):
         alpha = float(group["alpha_age"].iloc[0])
         epsilon = float(group["epsilon_age"].iloc[0])
-        old_capacity = old_ac_config.get(str(zone), baseline_zone_peak.get(str(zone), 0.0))
+        zone_peak = max(0.0, float(grown_zone_peak.get(str(zone), 0.0)))
+        required_nominal_capacity = zone_peak * old_ac_redundancy / max(1.0 - alpha, 1.0e-6)
+        old_capacity = max(float(old_ac_config.get(str(zone), 0.0)), required_nominal_capacity)
         effective_capacity = max(0.0, (1.0 - alpha) * float(old_capacity))
         effective_coeff = e_air_base / max(1.0 - epsilon, 1.0e-6)
+        extra_columns[f"old_ac_nominal_capacity_{zone}_kw"] = np.full(len(out), old_capacity)
         extra_columns[f"old_ac_capacity_eff_{zone}_kw"] = np.full(len(out), effective_capacity)
+        extra_columns[f"old_ac_capacity_margin_{zone}_kw"] = np.full(len(out), effective_capacity - zone_peak)
         extra_columns[f"old_ac_terminal_coeff_{zone}_kw_per_kw"] = np.full(len(out), effective_coeff)
         extra_columns[f"old_ac_alpha_age_{zone}"] = np.full(len(out), alpha)
         extra_columns[f"old_ac_epsilon_age_{zone}"] = np.full(len(out), epsilon)
@@ -564,38 +753,6 @@ def _load_heating_demand(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def _scale_heating_demand_to_it_load(hourly: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
-    scaling = config.get("scenario", {}).get("heat_demand_scaling", {})
-    if not scaling.get("enabled", False):
-        return hourly
-
-    method = scaling.get("method", "peak_ratio_to_it_load")
-    if method != "peak_ratio_to_it_load":
-        raise ValueError(f"Unsupported heat demand scaling method: {method}")
-
-    target_fraction = float(scaling.get("target_peak_fraction_of_it_load", 1.0))
-    if target_fraction < 0:
-        raise ValueError("target_peak_fraction_of_it_load must be non-negative")
-
-    it_peak = float(hourly["it_load_kw"].max())
-    heat_peak = float(hourly["heating_demand_kw"].max())
-    out = hourly.copy()
-    out["heating_demand_raw_kw"] = out["heating_demand_kw"]
-
-    if it_peak <= 0 or heat_peak <= 0:
-        out["heating_demand_scale_factor"] = 0.0
-        out["heating_demand_kw"] = 0.0
-        return out
-
-    scale_factor = target_fraction * it_peak / heat_peak
-    if not scaling.get("allow_upscale", False):
-        scale_factor = min(scale_factor, 1.0)
-
-    out["heating_demand_scale_factor"] = scale_factor
-    out["heating_demand_kw"] = out["heating_demand_kw"] * scale_factor
-    return out
-
-
 def _validate_hourly(hourly: pd.DataFrame) -> None:
     required = (
         "timestamp_hour_utc",
@@ -627,6 +784,24 @@ def _validate_hourly(hourly: pd.DataFrame) -> None:
 
 def load_input_data(config: dict[str, Any]) -> InputData:
     data_dir = Path(config["paths"]["data_dir"])
+    price_file = _configured_data_file(
+        data_dir,
+        config,
+        "price_file",
+        (
+            "20250101_20251231_PUN_ele_price_italy.xlsx",
+            "price_grid_beijing_2025_two_part_35_110kv_hourly_yuan_per_kwh.csv",
+        ),
+    )
+    carbon_file = _configured_data_file(
+        data_dir,
+        config,
+        "carbon_file",
+        (
+            "carbon_intensity_italy_electricitymaps_2024-12-31_2026-06-03.csv",
+            "carbon_factor_China_2025_kgCO2_per_kWh.csv",
+        ),
+    )
 
     rack_metadata = _read_csv(data_dir, "rack_metadata.csv")
     heat_matrix = pd.read_csv(data_dir / "H_matrix.csv", header=None)
@@ -634,18 +809,8 @@ def load_input_data(config: dict[str, Any]) -> InputData:
         _read_csv(data_dir, "time_series.csv"),
         ("hour", "timestamp_hour_utc", "timestamp_utc", "timestamp", "time", "datetime"),
     )
-    price = _with_canonical_slot_timestamp(
-        _read_csv(
-            data_dir,
-            "price_grid_beijing_2025_two_part_35_110kv_hourly_yuan_per_kwh.csv",
-        ),
-        ("timestamp_local",),
-        source_name="price",
-        require_preferred_column=True,
-    )
-    carbon = _with_carbon_hour_timestamp(
-        _read_csv(data_dir, "carbon_factor_China_2025_kgCO2_per_kWh.csv")
-    )
+    price = _with_price_hour_timestamp(_read_table(data_dir, price_file))
+    carbon = _with_carbon_hour_timestamp(_read_csv(data_dir, carbon_file))
     weather = _with_canonical_slot_timestamp(
         _read_csv(data_dir, "weather_open_meteo_hourly.csv"),
         ("timestamp_utc", "timestamp_hour_utc", "timestamp", "time", "datetime"),
@@ -665,7 +830,11 @@ def load_input_data(config: dict[str, Any]) -> InputData:
     )
     carbon_col = _numeric_col(
         carbon,
-        ("carbon_kg_per_kwh", "Beijing_kgCO2_per_kWh", "Mainland_China_kgCO2_per_kWh"),
+        (
+            "carbon_kg_per_kwh",
+            "Beijing_kgCO2_per_kWh",
+            "Mainland_China_kgCO2_per_kWh",
+        ),
         ("kgco2", "kwh"),
     )
     weather_col = _numeric_col(
@@ -719,7 +888,6 @@ def load_input_data(config: dict[str, Any]) -> InputData:
     scenario_growth_age = _build_scenario_growth_age_table(rack_metadata, rack_cols, config)
     rack_metadata = _attach_scenario_to_rack_metadata(rack_metadata, scenario_growth_age)
     hourly = _apply_business_growth_and_ac_aging(hourly, rack_metadata, scenario_growth_age, config)
-    hourly = _scale_heating_demand_to_it_load(hourly, config)
     _validate_hourly(hourly)
 
     return InputData(

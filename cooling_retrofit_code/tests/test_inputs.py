@@ -6,7 +6,6 @@ import pytest
 
 from data_utils import (
     _load_heating_demand,
-    _scale_heating_demand_to_it_load,
     _series_by_timestamp,
     _with_canonical_slot_timestamp,
     load_config,
@@ -81,6 +80,19 @@ def test_config_and_real_input_data_are_loaded_with_expected_columns():
     assert old_cap_cols
     assert old_coeff_cols
     assert frame[old_cap_cols].max().max() < frame[rack_cols].sum(axis=1).max()
+    zone_col = "ac_unit" if "ac_unit" in data.rack_metadata.columns else "zone"
+    metadata = data.rack_metadata.set_index("rack_id")
+    zone_loads = {}
+    for col in rack_cols:
+        rack_id = col.removeprefix("rack_it_").removesuffix("_kw")
+        zone = str(metadata.loc[rack_id, zone_col])
+        zone_loads.setdefault(zone, pd.Series(0.0, index=frame.index))
+        zone_loads[zone] = zone_loads[zone] + frame[col]
+    redundancy = config["scenario"]["existing_cooling_redundancy"]["old_ac_factor"]
+    for zone, load in zone_loads.items():
+        cap_col = f"old_ac_capacity_eff_{zone}_kw"
+        assert cap_col in frame.columns
+        assert float(frame[cap_col].min()) + 1.0e-6 >= float(load.max()) * redundancy
 
 
 def test_input_data_replicates_room_five_times_with_heterogeneous_growth_and_aging():
@@ -184,30 +196,26 @@ def test_heating_demand_loader_prefers_chinese_heat_column_and_rejects_ambiguous
         _load_heating_demand(invalid)
 
 
-def test_heating_demand_can_be_scaled_to_it_peak():
-    hourly = pd.DataFrame(
-        {
-            "it_load_kw": [100.0, 200.0, 50.0],
-            "heating_demand_kw": [1000.0, 8000.0, 0.0],
-        }
+def test_heating_demand_is_loaded_without_it_peak_scaling():
+    config = load_config(PROJECT_DIR / "config.json")
+    data = load_input_data(config)
+    frame = data.hourly
+
+    legacy_config_key = "heat" + "_demand" + "_scaling"
+    legacy_columns = {"heating_demand_" + "raw_kw", "heating_demand_" + "scale_factor"}
+    assert legacy_config_key not in config.get("scenario", {})
+    assert legacy_columns.isdisjoint(frame.columns)
+
+    raw = _load_heating_demand(data.heating_demand)
+    merged = frame[["timestamp_hour_utc", "heating_demand_kw"]].merge(
+        raw,
+        on="timestamp_hour_utc",
+        suffixes=("", "_raw"),
     )
-    config = {
-        "scenario": {
-            "heat_demand_scaling": {
-                "enabled": True,
-                "method": "peak_ratio_to_it_load",
-                "target_peak_fraction_of_it_load": 0.9,
-                "allow_upscale": False,
-            }
-        }
-    }
-
-    scaled = _scale_heating_demand_to_it_load(hourly, config)
-
-    assert scaled["heating_demand_kw"].max() == pytest.approx(180.0)
-    assert scaled["heating_demand_raw_kw"].tolist() == [1000.0, 8000.0, 0.0]
-    assert scaled["heating_demand_scale_factor"].nunique() == 1
-    assert scaled["heating_demand_scale_factor"].iloc[0] == pytest.approx(180.0 / 8000.0)
+    np.testing.assert_allclose(
+        merged["heating_demand_kw"].to_numpy(dtype=float),
+        merged["heating_demand_kw_raw"].to_numpy(dtype=float),
+    )
 
 
 def test_kmeans_typical_days_selects_eight_centroids_and_optional_peak_day_from_real_data():

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import uuid
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
+from copy import deepcopy
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -10,12 +13,18 @@ import numpy as np
 import pandas as pd
 
 from analyze_results import write_report
+from benchmark_scenarios import evaluate_benchmark_scenarios
 from convergence_analysis import analyze_pymoo_convergence
 from data_utils import load_config, load_input_data
 from decision import DecisionSchema
-from model import evaluate_solution
+from model import EvaluationContext, evaluate_solution as _default_evaluate_solution
 from nsga2 import crowding_distance, fast_non_dominated_sort
-from plotting import save_convergence_plots, save_pareto_distribution_plot, save_pareto_plot
+from plotting import (
+    save_benchmark_comparison_plot,
+    save_convergence_plots,
+    save_pareto_distribution_plot,
+    save_pareto_plot,
+)
 from spatial_analysis import run_spatial_analysis
 from typical_days import build_time_index
 
@@ -29,6 +38,13 @@ SYSTEM_CAPACITY_NAMES = (
     "delta_cap_chiller",
     "delta_cap_tower",
 )
+
+_WORKER_SCHEMA: DecisionSchema | None = None
+_WORKER_CONFIG: dict | None = None
+_WORKER_TIME_FRAME: pd.DataFrame | None = None
+_WORKER_PEAK_LOAD_BY_ZONE_KW: dict[str, float] | None = None
+_WORKER_CONTEXT: EvaluationContext | None = None
+evaluate_solution = _default_evaluate_solution
 
 
 def infer_zone_ids(data) -> list[str]:
@@ -50,7 +66,7 @@ def peak_load_by_zone_from_data(
     rack_metadata: pd.DataFrame,
     zone_ids: list[str],
 ) -> dict[str, float]:
-    rack_cols = [col for col in time_frame.columns if col.startswith("rack_it_") and col.endswith("_kw")]
+    rack_cols = [col for col in time_frame.columns if "rack_it_" in col and col.endswith("_kw")]
     if not rack_cols or "rack_id" not in rack_metadata.columns:
         peak = float(pd.to_numeric(time_frame["it_load_kw"], errors="raise").max())
         return {zone_id: peak / max(1, len(zone_ids)) for zone_id in zone_ids}
@@ -61,18 +77,48 @@ def peak_load_by_zone_from_data(
     fallback = zone_ids[0] if zone_ids else "z1"
     for col in rack_cols:
         rack_id = col.removesuffix("_kw")
-        zone_id = fallback
-        if rack_id in metadata.index:
-            row = metadata.loc[rack_id]
-            for candidate_col in ("ac_unit", "zone"):
-                if candidate_col in metadata.columns:
-                    candidate = str(row[candidate_col])
-                    if candidate in zone_set:
-                        zone_id = candidate
-                        break
+        zone_id = _zone_id_for_rack(rack_id, metadata, zone_set, fallback)
         zone_series[zone_id] = zone_series[zone_id] + pd.to_numeric(time_frame[col], errors="raise")
 
     return {zone_id: float(series.max()) for zone_id, series in zone_series.items()}
+
+
+def zone_rack_count_from_metadata(rack_metadata: pd.DataFrame, zone_ids: list[str]) -> dict[str, int]:
+    fallback = {zone_id: 1 for zone_id in zone_ids}
+    if rack_metadata.empty:
+        return fallback
+    zone_col = "ac_unit" if "ac_unit" in rack_metadata.columns else "zone" if "zone" in rack_metadata.columns else ""
+    if not zone_col:
+        return fallback
+
+    counts = rack_metadata[zone_col].dropna().astype(str).value_counts()
+    return {zone_id: max(1, int(counts.get(zone_id, 0))) for zone_id in zone_ids}
+
+
+def _zone_id_for_rack(
+    rack_id: str,
+    metadata: pd.DataFrame,
+    zone_set: set[str],
+    fallback: str,
+) -> str:
+    lookup_id = rack_id
+    room_id: str | None = None
+    if rack_id not in metadata.index and "_rack_it_" in rack_id:
+        room_id, lookup_id = rack_id.split("_", 1)
+    if lookup_id not in metadata.index:
+        return fallback
+
+    row = metadata.loc[lookup_id]
+    for candidate_col in ("ac_unit", "zone"):
+        if candidate_col not in metadata.columns:
+            continue
+        candidate = str(row[candidate_col])
+        room_candidate = f"{room_id}_{candidate}" if room_id else candidate
+        if room_candidate in zone_set:
+            return room_candidate
+        if candidate in zone_set:
+            return candidate
+    return fallback
 
 
 def _json_dumps(value) -> str:
@@ -124,6 +170,8 @@ def _solution_row(
 
     screening = artifacts.get("screening")
     weight_soft_penalty = artifacts.get("weight_soft_penalty", {})
+    weight_hard = artifacts.get("weight_hard_constraint", {})
+    diagnostics = artifacts.get("diagnostics", {})
     return {
         "solution_id": solution_id,
         "generation": generation,
@@ -135,6 +183,10 @@ def _solution_row(
         "soft_reasons": ";".join(getattr(screening, "soft_reasons", [])),
         "weight_soft_penalty_cost_yuan_per_year": float(weight_soft_penalty.get("cost_yuan_per_year", 0.0)),
         "weight_soft_penalty_carbon_kg_per_year": float(weight_soft_penalty.get("carbon_kg_per_year", 0.0)),
+        "weight_hard_violation_kg": float(
+            weight_hard.get("violation_kg", _weight_hard_violation_kg(screening))
+        ),
+        "weight_hard_reasons": ";".join(weight_hard.get("reasons", _weight_hard_reasons(screening))),
         "front": front,
         "reasons": ";".join(result.reasons),
         "raw_vector_json": _vector_json(vector),
@@ -142,7 +194,55 @@ def _solution_row(
         "config_by_zone_json": config_by_zone_json,
         "zone_capacity_json": zone_capacity_json,
         "system_capacity_json": system_capacity_json,
+        "build_mode": diagnostics.get("build_mode", ""),
+        "warm_start_hit": bool(diagnostics.get("warm_start_hit", False)),
+        "warm_start_key_match": diagnostics.get("warm_start_key_match", ""),
+        "warm_start_attempted": bool(diagnostics.get("warm_start_attempted", False)),
+        "warm_start_values_applied": int(diagnostics.get("warm_start_values_applied", 0) or 0),
+        "warm_start_cache_entries": int(diagnostics.get("warm_start_cache_entries", 0) or 0),
+        "warm_start_exact_hits": int(diagnostics.get("warm_start_exact_hits", 0) or 0),
+        "warm_start_neighbor_hits": int(diagnostics.get("warm_start_neighbor_hits", 0) or 0),
+        "warm_start_misses": int(diagnostics.get("warm_start_misses", 0) or 0),
+        "inner_build_total_s": float(diagnostics.get("inner_build_total_s", 0.0) or 0.0),
+        "inner_update_s": float(diagnostics.get("inner_update_s", 0.0) or 0.0),
+        "inner_optimize_s": float(diagnostics.get("inner_optimize_s", 0.0) or 0.0),
+        "template_build_once_s": float(diagnostics.get("template_build_once_s", 0.0) or 0.0),
+        "template_reuse_hit": bool(diagnostics.get("template_reuse_hit", False)),
+        "persistent_template_backend": diagnostics.get("persistent_template_backend", ""),
+        "parallel_fallback": bool(diagnostics.get("parallel_fallback", False)),
+        "parallel_fallback_reason": diagnostics.get("parallel_fallback_reason", ""),
+        "parallel_workers": int(diagnostics.get("parallel_workers", 1) or 1),
+        "parallel_chunksize": int(diagnostics.get("parallel_chunksize", 1) or 1),
+        "gurobi_time_limit_seconds": float(diagnostics.get("gurobi_time_limit_seconds", 0.0) or 0.0),
+        "gurobi_mip_gap": float(diagnostics.get("gurobi_mip_gap", 0.0) or 0.0),
+        "gurobi_threads": int(diagnostics.get("gurobi_threads", 0) or 0),
+        "gurobi_mip_focus": int(diagnostics.get("gurobi_mip_focus", 0) or 0),
+        "gurobi_nodefile_start_gb": float(diagnostics.get("gurobi_nodefile_start_gb", 0.0) or 0.0),
+        "gurobi_numeric_focus": int(diagnostics.get("gurobi_numeric_focus", 0) or 0),
+        "gurobi_output_flag": int(diagnostics.get("gurobi_output_flag", 0) or 0),
+        "heat_topology_nonzero_edges": int(diagnostics.get("heat_topology_nonzero_edges", 0) or 0),
+        "heat_topology_density": float(diagnostics.get("heat_topology_density", 0.0) or 0.0),
     }
+
+
+def _weight_hard_reasons(screening) -> list[str]:
+    return [
+        str(reason)
+        for reason in getattr(screening, "reasons", [])
+        if "weight_margin_exceeded" in str(reason)
+    ]
+
+
+def _weight_hard_violation_kg(screening) -> float:
+    total = 0.0
+    for reason in _weight_hard_reasons(screening):
+        parts = reason.split(":")
+        if len(parts) >= 3 and parts[-2] == "weight_margin_exceeded":
+            try:
+                total += max(0.0, float(parts[-1]))
+            except ValueError:
+                continue
+    return total
 
 
 def run(config_path: str | Path) -> dict[str, object]:
@@ -152,6 +252,11 @@ def run(config_path: str | Path) -> dict[str, object]:
     time_index = build_time_index(data.hourly, config["typical_days"])
 
     zone_ids = infer_zone_ids(data)
+    config = deepcopy(config)
+    config.setdefault("scenario", {})["zone_rack_count"] = zone_rack_count_from_metadata(
+        getattr(data, "rack_metadata", pd.DataFrame()),
+        zone_ids,
+    )
     schema = _build_schema(zone_ids, config)
 
     nsga2_config = config["solver"]["nsga2"]
@@ -173,46 +278,41 @@ def run(config_path: str | Path) -> dict[str, object]:
     all_generations: dict[int, int] = {}
     next_solution_id = 0
 
-    evaluations = _evaluate_population(population, schema, config, time_index.frame, peak_load_by_zone_kw)
-    population_solution_ids: list[int] = []
-    for vector, result in zip(population, evaluations):
-        all_vectors[next_solution_id] = vector
-        all_results[next_solution_id] = result
-        all_generations[next_solution_id] = 0
-        population_solution_ids.append(next_solution_id)
-        next_solution_id += 1
-
-    for generation in range(1, generations + 1):
-        offspring = _make_offspring(
-            population,
-            evaluations,
-            schema,
-            rng,
-            crossover_probability,
-            mutation_probability,
-        )
-        offspring_evaluations = _evaluate_population(
-            offspring,
-            schema,
-            config,
-            time_index.frame,
-            peak_load_by_zone_kw,
-        )
-        offspring_solution_ids: list[int] = []
-        for vector, result in zip(offspring, offspring_evaluations):
+    with PopulationEvaluator(schema, config, time_index.frame, peak_load_by_zone_kw) as evaluator:
+        evaluations = evaluator.evaluate(population)
+        population_solution_ids: list[int] = []
+        for vector, result in zip(population, evaluations):
             all_vectors[next_solution_id] = vector
             all_results[next_solution_id] = result
-            all_generations[next_solution_id] = generation
-            offspring_solution_ids.append(next_solution_id)
+            all_generations[next_solution_id] = 0
+            population_solution_ids.append(next_solution_id)
             next_solution_id += 1
 
-        combined_population = population + offspring
-        combined_evaluations = evaluations + offspring_evaluations
-        combined_solution_ids = population_solution_ids + offspring_solution_ids
-        selected = _select_next_population_indices(combined_evaluations, population_size)
-        population = [combined_population[index] for index in selected]
-        evaluations = [combined_evaluations[index] for index in selected]
-        population_solution_ids = [combined_solution_ids[index] for index in selected]
+        for generation in range(1, generations + 1):
+            offspring = _make_offspring(
+                population,
+                evaluations,
+                schema,
+                rng,
+                crossover_probability,
+                mutation_probability,
+            )
+            offspring_evaluations = evaluator.evaluate(offspring)
+            offspring_solution_ids: list[int] = []
+            for vector, result in zip(offspring, offspring_evaluations):
+                all_vectors[next_solution_id] = vector
+                all_results[next_solution_id] = result
+                all_generations[next_solution_id] = generation
+                offspring_solution_ids.append(next_solution_id)
+                next_solution_id += 1
+
+            combined_population = population + offspring
+            combined_evaluations = evaluations + offspring_evaluations
+            combined_solution_ids = population_solution_ids + offspring_solution_ids
+            selected = _select_next_population_indices(combined_evaluations, population_size)
+            population = [combined_population[index] for index in selected]
+            evaluations = [combined_evaluations[index] for index in selected]
+            population_solution_ids = [combined_solution_ids[index] for index in selected]
 
     feasible_solution_ids = [
         solution_id
@@ -267,6 +367,16 @@ def run(config_path: str | Path) -> dict[str, object]:
         config=config,
         output_dir=output_dir,
     ) if not pareto.empty else {"available": False, "reason": "empty_pareto"}
+    benchmark_comparison = evaluate_benchmark_scenarios(
+        schema=schema,
+        config=config,
+        time_frame=time_index.frame,
+        peak_load_by_zone_kw=peak_load_by_zone_kw,
+        pareto=pareto,
+    )
+    benchmark_path = output_dir / "benchmark_comparison.csv"
+    benchmark_comparison.to_csv(benchmark_path, index=False, encoding="utf-8-sig")
+    benchmark_plot_path = save_benchmark_comparison_plot(benchmark_comparison, output_dir)
     report_path = write_report(all_evaluations, pareto, config, output_dir)
 
     return {
@@ -280,6 +390,9 @@ def run(config_path: str | Path) -> dict[str, object]:
         "convergence_figure_paths": convergence_figure_paths,
         "distribution_path": distribution_path,
         "spatial_result": spatial_result,
+        "benchmark_comparison": benchmark_comparison,
+        "benchmark_path": benchmark_path,
+        "benchmark_plot_path": benchmark_plot_path,
         "scenario_growth_age_path": scenario_growth_age_path,
     }
 
@@ -291,16 +404,182 @@ def _evaluate_population(
     time_frame: pd.DataFrame,
     peak_load_by_zone_kw: dict[str, float],
 ) -> list:
-    return [
-        evaluate_solution(
-            vector,
-            schema,
-            config,
-            time_frame,
-            peak_load_by_zone_kw,
+    with PopulationEvaluator(schema, config, time_frame, peak_load_by_zone_kw) as evaluator:
+        return evaluator.evaluate(population)
+
+
+class PopulationEvaluator:
+    def __init__(
+        self,
+        schema: DecisionSchema,
+        config: dict,
+        time_frame: pd.DataFrame,
+        peak_load_by_zone_kw: dict[str, float],
+    ) -> None:
+        self.schema = schema
+        self.config = config
+        self.time_frame = time_frame
+        self.peak_load_by_zone_kw = peak_load_by_zone_kw
+        self.executor: ProcessPoolExecutor | None = None
+        self.context: EvaluationContext | None = None
+        parallel_config = config.get("solver", {}).get("parallel", {})
+        self.workers = int(parallel_config.get("workers", 1)) if isinstance(parallel_config, dict) else 1
+        self.parallel_enabled = bool(parallel_config.get("enabled", False)) if isinstance(parallel_config, dict) else False
+        self.strict = bool(parallel_config.get("strict", False)) if isinstance(parallel_config, dict) else False
+        self.chunksize = max(1, int(parallel_config.get("chunksize", 1))) if isinstance(parallel_config, dict) else 1
+        self.use_legacy_evaluate_hook = evaluate_solution is not _default_evaluate_solution
+        self.parallel_fallback_reason = ""
+
+    def __enter__(self) -> "PopulationEvaluator":
+        if self.use_legacy_evaluate_hook:
+            return self
+        if self.parallel_enabled and self.workers > 1:
+            worker_config = _parallel_worker_config(self.config)
+            self.executor = ProcessPoolExecutor(
+                max_workers=self.workers,
+                initializer=_init_parallel_worker,
+                initargs=(self.schema, worker_config, self.time_frame, self.peak_load_by_zone_kw),
+            )
+        else:
+            self.context = EvaluationContext(
+                self.schema,
+                self.config,
+                self.time_frame,
+                self.peak_load_by_zone_kw,
+            )
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self._shutdown_executor()
+        return False
+
+    def evaluate(self, population: list[np.ndarray]) -> list:
+        if not population:
+            return []
+        if self.use_legacy_evaluate_hook:
+            return [
+                evaluate_solution(
+                    vector,
+                    self.schema,
+                    self.config,
+                    self.time_frame,
+                    self.peak_load_by_zone_kw,
+                )
+                for vector in population
+            ]
+        if self.executor is not None:
+            try:
+                results = list(
+                    self.executor.map(
+                        _evaluate_vector_in_parallel_worker,
+                        population,
+                        chunksize=self.chunksize,
+                    )
+                )
+                return self._attach_parallel_diagnostics(results, fallback=False, reason="")
+            except Exception as exc:
+                if self.strict or not _is_parallel_memory_failure(exc):
+                    raise
+                reason = _exception_summary(exc)
+                self.parallel_fallback_reason = reason
+                self._shutdown_executor()
+                if self.context is None:
+                    self.context = EvaluationContext(
+                        self.schema,
+                        self.config,
+                        self.time_frame,
+                        self.peak_load_by_zone_kw,
+                    )
+                results = [self.context.evaluate(vector) for vector in population]
+                return self._attach_parallel_diagnostics(results, fallback=True, reason=reason)
+        if self.context is None:
+            self.context = EvaluationContext(
+                self.schema,
+                self.config,
+                self.time_frame,
+                self.peak_load_by_zone_kw,
+            )
+        results = [self.context.evaluate(vector) for vector in population]
+        fallback = bool(self.parallel_fallback_reason)
+        return self._attach_parallel_diagnostics(
+            results,
+            fallback=fallback,
+            reason=self.parallel_fallback_reason if fallback else "",
         )
-        for vector in population
-    ]
+
+    def _shutdown_executor(self) -> None:
+        if self.executor is not None:
+            self.executor.shutdown(wait=True)
+            self.executor = None
+
+    def _attach_parallel_diagnostics(self, results: list, fallback: bool, reason: str) -> list:
+        active_workers = self.workers if self.executor is not None and self.parallel_enabled and self.workers > 1 else 1
+        for result in results:
+            artifacts = getattr(result, "artifacts", None)
+            if not isinstance(artifacts, dict):
+                continue
+            diagnostics = artifacts.setdefault("diagnostics", {})
+            diagnostics["parallel_fallback"] = bool(fallback)
+            diagnostics["parallel_fallback_reason"] = reason if fallback else ""
+            diagnostics["parallel_workers"] = int(active_workers)
+            diagnostics["parallel_chunksize"] = int(self.chunksize)
+        return results
+
+
+def _is_parallel_memory_failure(exc: BaseException) -> bool:
+    if isinstance(exc, (MemoryError, BrokenProcessPool, OSError)):
+        return True
+    text = _exception_summary(exc).lower()
+    return any(
+        token in text
+        for token in (
+            "out of memory",
+            "oom",
+            "memoryerror",
+            "cannot allocate memory",
+            "not enough memory",
+            "brokenprocesspool",
+        )
+    )
+
+
+def _exception_summary(exc: BaseException) -> str:
+    parts = [type(exc).__name__, str(exc)]
+    for attr in ("__cause__", "__context__"):
+        nested = getattr(exc, attr, None)
+        if nested is not None:
+            parts.extend([type(nested).__name__, str(nested)])
+    return ": ".join(part for part in parts if part)
+
+
+def _parallel_worker_config(config: dict) -> dict:
+    worker_config = deepcopy(config)
+    solver = worker_config.setdefault("solver", {})
+    gurobi = solver.setdefault("gurobi", {})
+    parallel = solver.get("parallel", {})
+    if isinstance(parallel, dict) and "gurobi_threads_per_worker" in parallel:
+        gurobi["threads"] = int(parallel["gurobi_threads_per_worker"])
+    return worker_config
+
+
+def _init_parallel_worker(
+    schema: DecisionSchema,
+    config: dict,
+    time_frame: pd.DataFrame,
+    peak_load_by_zone_kw: dict[str, float],
+) -> None:
+    global _WORKER_SCHEMA, _WORKER_CONFIG, _WORKER_TIME_FRAME, _WORKER_PEAK_LOAD_BY_ZONE_KW, _WORKER_CONTEXT
+    _WORKER_SCHEMA = schema
+    _WORKER_CONFIG = config
+    _WORKER_TIME_FRAME = time_frame
+    _WORKER_PEAK_LOAD_BY_ZONE_KW = peak_load_by_zone_kw
+    _WORKER_CONTEXT = EvaluationContext(schema, config, time_frame, peak_load_by_zone_kw)
+
+
+def _evaluate_vector_in_parallel_worker(vector: np.ndarray):
+    if _WORKER_CONTEXT is None:
+        raise RuntimeError("Parallel worker was not initialized.")
+    return _WORKER_CONTEXT.evaluate(vector)
 
 
 def _build_schema(zone_ids: list[str], config: dict) -> DecisionSchema:

@@ -10,9 +10,18 @@ pytest.importorskip("gurobipy")
 from data_utils import load_config, load_input_data
 from decision import DecisionSchema
 from feasibility_oracle import FeasibilityOracle
-from inner_dispatch import InnerDispatchMILP, InnerSolveResult, _rack_zone_map
+from inner_dispatch import (
+    InnerDispatchMILP,
+    InnerSolveResult,
+    _heat_adjacency,
+    _heat_adjacency_edge_count,
+    _heat_influence_from_adjacency,
+    _heat_influence_matrix,
+    _rack_zone_map,
+)
 from model import _capacity_cost, _crf, _floor_weight_margin_by_zone, evaluate_solution
 from repair import repair_vector, screen_decision
+from run_optimization import peak_load_by_zone_from_data, zone_rack_count_from_metadata
 from typical_days import build_time_index
 
 
@@ -60,6 +69,32 @@ def _minimal_config() -> dict:
         "technology": {},
         "solver": {},
     }
+
+
+def test_heat_sparse_adjacency_matches_dense_matrix_influence():
+    matrix = np.asarray(
+        [
+            [0.0, 0.2, 0.0],
+            [0.0, 0.0, 0.5],
+            [0.1, 0.0, 0.0],
+        ],
+        dtype=float,
+    )
+    q_air = np.asarray(
+        [
+            [10.0, 20.0, 30.0],
+            [1.0, 2.0, 3.0],
+        ],
+        dtype=float,
+    )
+
+    adjacency = _heat_adjacency(matrix, rack_count=3)
+    sparse = _heat_influence_from_adjacency(q_air, adjacency)
+    dense = q_air @ matrix
+
+    assert _heat_adjacency_edge_count(adjacency) == 3
+    np.testing.assert_allclose(sparse, dense)
+    np.testing.assert_allclose(_heat_influence_matrix(q_air, matrix), dense)
 
 
 def test_decision_schema_preserves_all_new_model_options_and_capacity_layout():
@@ -154,6 +189,51 @@ def test_replicated_room_rack_zone_map_uses_room_prefixed_original_metadata():
     assert _rack_zone_map(config, rack_ids, zone_ids) == zone_ids
 
 
+def test_peak_load_by_zone_uses_room_prefixed_rack_mapping():
+    time_frame = pd.DataFrame(
+        {
+            "timestamp_hour_utc": pd.date_range("2026-01-01", periods=2, freq="h", tz="UTC"),
+            "room01_rack_it_000_kw": [10.0, 40.0],
+            "room01_rack_it_001_kw": [20.0, 30.0],
+            "room02_rack_it_000_kw": [70.0, 10.0],
+            "it_load_kw": [100.0, 80.0],
+        }
+    )
+    rack_metadata = pd.DataFrame(
+        {
+            "rack_id": ["rack_it_000", "rack_it_001"],
+            "ac_unit": ["cdz1", "cdz2"],
+        }
+    )
+
+    peaks = peak_load_by_zone_from_data(
+        time_frame,
+        rack_metadata,
+        ["room01_cdz1", "room01_cdz2", "room02_cdz1", "room02_cdz2"],
+    )
+
+    assert peaks["room01_cdz1"] == pytest.approx(40.0)
+    assert peaks["room01_cdz2"] == pytest.approx(30.0)
+    assert peaks["room02_cdz1"] == pytest.approx(70.0)
+    assert peaks["room02_cdz2"] == pytest.approx(0.0)
+
+
+def test_zone_rack_count_from_metadata_counts_area_racks():
+    rack_metadata = pd.DataFrame(
+        {
+            "rack_id": ["r0", "r1", "r2", "r3"],
+            "ac_unit": ["room01_cdz1", "room01_cdz1", "room02_cdz1", "room02_cdz2"],
+        }
+    )
+
+    counts = zone_rack_count_from_metadata(
+        rack_metadata,
+        ["room01_cdz1", "room02_cdz1", "missing_zone"],
+    )
+
+    assert counts == {"room01_cdz1": 2, "room02_cdz1": 1, "missing_zone": 1}
+
+
 def test_feasibility_oracle_repairs_screens_and_remembers_infeasible_signatures():
     schema = DecisionSchema(["z1"], zone_cap_upper_kw=50.0)
     oracle = FeasibilityOracle(
@@ -175,7 +255,7 @@ def test_feasibility_oracle_repairs_screens_and_remembers_infeasible_signatures(
     assert second.screening.feasible is False
 
 
-def test_repair_clears_incompatible_capacity_without_hard_weight_scaling():
+def test_repair_clears_incompatible_capacity_and_enforces_hard_weight_margin():
     schema = DecisionSchema(["z1"])
     vector = schema.encode_default()
     vector[0] = 2
@@ -186,15 +266,47 @@ def test_repair_clears_incompatible_capacity_without_hard_weight_scaling():
     repaired, actions = repair_vector(vector, schema, {"z1": 80.0}, {"z1": 120.0})
     decision = schema.decode(repaired)
 
-    assert decision.cap_ac_new["z1"] == pytest.approx(100.0)
+    assert decision.cap_ac_new["z1"] * 5.0 <= 120.0 + 1.0e-6
     assert decision.cap_cdu["z1"] == 0.0
     assert decision.cap_rdhx["z1"] == 0.0
     assert decision.cap_ashp >= 0.0
     assert any("clear_rdhx" in action for action in actions)
-    assert not any("weight_margin" in action for action in actions)
+    assert any("scale_capacity_to_weight_margin" in action for action in actions)
 
 
-def test_screening_records_weight_excess_as_soft_violation_without_blocking():
+def test_repair_clips_compatible_capacity_to_effective_peak_bounds():
+    schema = DecisionSchema(
+        ["z1"],
+        zone_cap_upper_kw={"cap_ac_new": 5000.0, "cap_rdhx": 5000.0, "cap_cdu": 5000.0},
+    )
+
+    rdhx = schema.encode_default()
+    rdhx[0] = 5
+    rdhx[2] = 3000.0
+    repaired, actions = repair_vector(rdhx, schema, {"z1": 100.0}, {"z1": 1.0e9})
+    decision = schema.decode(repaired)
+    assert decision.cap_rdhx["z1"] == pytest.approx(100.0)
+    assert any("limit_rdhx_to_effective_peak" in action for action in actions)
+
+    cold_plate = schema.encode_default()
+    cold_plate[0] = 6
+    cold_plate[1] = 3000.0
+    cold_plate[3] = 3000.0
+    repaired, actions = repair_vector(
+        cold_plate,
+        schema,
+        {"z1": 100.0},
+        {"z1": 1.0e9},
+        cold_plate_fraction=0.7,
+    )
+    decision = schema.decode(repaired)
+    assert decision.cap_ac_new["z1"] == pytest.approx(100.0)
+    assert decision.cap_cdu["z1"] == pytest.approx(70.0)
+    assert any("limit_ac_new_to_effective_peak" in action for action in actions)
+    assert any("limit_cdu_to_effective_peak" in action for action in actions)
+
+
+def test_screening_records_weight_excess_as_hard_violation_with_tolerance():
     schema = DecisionSchema(["z1"])
     vector = schema.encode_default()
     vector[0] = 1
@@ -210,10 +322,26 @@ def test_screening_records_weight_excess_as_soft_violation_without_blocking():
         equipment_kg_per_kw={"ac_new": 5.0},
     )
 
+    assert screening.feasible is False
+    assert screening.violation == pytest.approx(400.0)
+    assert screening.soft_violation == pytest.approx(0.0)
+    assert "weight_margin_exceeded" in "|".join(screening.reasons)
+    assert not screening.soft_reasons
+
+    within_tolerance = schema.encode_default()
+    within_tolerance[0] = 1
+    within_tolerance[1] = (100.0 + 5.0e-7) / 5.0
+    screening = screen_decision(
+        schema.decode(within_tolerance),
+        {"z1": 20.0},
+        {"z1": 100.0},
+        chiller_old_kw=200.0,
+        tower_old_kw=300.0,
+        equipment_kg_per_kw={"ac_new": 5.0},
+    )
+
     assert screening.feasible is True
     assert screening.violation == pytest.approx(0.0)
-    assert screening.soft_violation == pytest.approx(400.0)
-    assert "weight_margin_exceeded" in "|".join(screening.soft_reasons)
 
 
 def test_screening_blocks_clear_shortages_but_allows_non_chiller_and_recovered_heat_paths():
@@ -301,7 +429,7 @@ def test_dispatch_keeps_cdu_free_cooling_out_of_chiller_evaporator_load():
     assert result.diagnostics["max_heat_balance_residual_kw"] <= 1e-5
 
 
-def test_dispatch_treats_heating_demand_as_hard_constraint_without_unserved_penalty():
+def test_dispatch_treats_heating_demand_as_upper_bound_without_unserved_penalty():
     schema = DecisionSchema(["z1"])
     config = _config()
     config.setdefault("technology", {}).setdefault("liquid_heat_fraction", {})["cold_plate"] = 1.0
@@ -318,15 +446,29 @@ def test_dispatch_treats_heating_demand_as_hard_constraint_without_unserved_pena
         tower_old_kw=0.0,
     )
 
-    assert result.feasible is False
-    assert result.dispatch.empty
-    assert result.diagnostics["reason"] == "no_solution"
+    assert result.feasible is True
+    assert result.dispatch["q_heat_kw"].max() <= 50.0 + 1.0e-6
+    assert result.diagnostics["max_heat_demand_upper_violation_kw"] <= 1e-6
+    assert "q_heat_unserved_kw" not in result.dispatch.columns
+    assert "heat_unserved_penalty_yuan" not in result.dispatch.columns
+    assert result.diagnostics["max_power_balance_residual_kw"] <= 1e-5
+    assert result.diagnostics["max_heat_balance_residual_kw"] <= 1e-5
 
 
 def test_dispatch_air_service_tracks_air_load_and_nested_solver_config():
     schema = DecisionSchema(["z1"])
     config = _config()
-    config["solver"] = {"gurobi": {"time_limit_seconds": 5, "mip_gap": 0.05, "threads": 1}}
+    config["solver"] = {
+        "gurobi": {
+            "time_limit_seconds": 5,
+            "mip_gap": 0.05,
+            "threads": 1,
+            "mip_focus": 1,
+            "nodefile_start_gb": 0.5,
+            "numeric_focus": 1,
+            "output_flag": 0,
+        }
+    }
     config.setdefault("technology", {}).setdefault("liquid_heat_fraction", {})["cold_plate"] = 0.0
     config.setdefault("technology", {}).setdefault("liquid_heat_fraction", {})["rdhx"] = 0.0
     vector = schema.encode_default()
@@ -347,6 +489,132 @@ def test_dispatch_air_service_tracks_air_load_and_nested_solver_config():
     assert result.dispatch["s_air_kw"].tolist() == pytest.approx(result.dispatch["q_air_kw"].tolist())
     assert result.diagnostics["gurobi_time_limit_seconds"] == pytest.approx(5.0)
     assert result.diagnostics["gurobi_mip_gap"] == pytest.approx(0.05)
+    assert result.diagnostics["gurobi_threads"] == 1
+    assert result.diagnostics["gurobi_mip_focus"] == 1
+    assert result.diagnostics["gurobi_nodefile_start_gb"] == pytest.approx(0.5)
+    assert result.diagnostics["gurobi_numeric_focus"] == 1
+    assert result.diagnostics["gurobi_output_flag"] == 0
+
+
+def test_hotspot_constraints_can_be_disabled_while_keeping_temperature_diagnostics():
+    schema = DecisionSchema(["z1"])
+    config = _config()
+    config.setdefault("technology", {}).setdefault("thermal", {})["hotspot_constraints_enabled"] = False
+    config["technology"]["thermal"]["rack_temp_max_c"] = 0.0
+    config.setdefault("technology", {}).setdefault("liquid_heat_fraction", {})["cold_plate"] = 0.0
+    config.setdefault("technology", {}).setdefault("liquid_heat_fraction", {})["rdhx"] = 0.0
+    vector = schema.encode_default()
+    vector[0] = 1
+    vector[1] = 100.0
+    vector[-2] = 100.0
+    vector[-1] = 150.0
+
+    result = InnerDispatchMILP(config).solve(
+        decision=schema.decode(vector),
+        time_frame=_time_frame(),
+        peak_load_by_zone_kw={"z1": 100.0},
+        chiller_old_kw=0.0,
+        tower_old_kw=0.0,
+    )
+
+    assert result.feasible is True
+    assert result.diagnostics["hotspot_constraints_enabled"] is False
+    assert result.dispatch["max_theta_c"].max() > 0.0
+    assert result.dispatch["hotspot_slack_c"].sum() == pytest.approx(0.0)
+    assert result.dispatch["hotspot_penalty_yuan"].sum() == pytest.approx(0.0)
+
+
+def test_dispatch_accepts_warm_start_payload_without_changing_feasible_solution():
+    schema = DecisionSchema(["z1"])
+    config = _config()
+    config["solver"] = {"gurobi": {"time_limit_seconds": 5, "mip_gap": 0.05, "threads": 1}}
+    config.setdefault("technology", {}).setdefault("liquid_heat_fraction", {})["cold_plate"] = 0.0
+    config.setdefault("technology", {}).setdefault("liquid_heat_fraction", {})["rdhx"] = 0.0
+    vector = schema.encode_default()
+    vector[0] = 1
+    vector[1] = 100.0
+    vector[-2] = 100.0
+    vector[-1] = 150.0
+    decision = schema.decode(vector)
+
+    first = InnerDispatchMILP(config).solve(
+        decision=decision,
+        time_frame=_time_frame(),
+        peak_load_by_zone_kw={"z1": 100.0},
+        chiller_old_kw=0.0,
+        tower_old_kw=0.0,
+    )
+    second = InnerDispatchMILP(config).solve(
+        decision=decision,
+        time_frame=_time_frame(),
+        peak_load_by_zone_kw={"z1": 100.0},
+        chiller_old_kw=0.0,
+        tower_old_kw=0.0,
+        warm_start=first.warm_start_payload,
+    )
+
+    assert first.feasible is True
+    assert first.warm_start_payload["__format__"] == "dense_v1"
+    assert "p_grid" in first.warm_start_payload["vars"]
+    assert second.feasible is True
+    assert second.diagnostics["warm_start_attempted"] is True
+    assert second.diagnostics["warm_start_values_applied"] > 0
+    assert second.objective_value == pytest.approx(first.objective_value)
+    assert second.diagnostics["max_power_balance_residual_kw"] == pytest.approx(0.0, abs=1.0e-6)
+    assert second.diagnostics["max_heat_balance_residual_kw"] == pytest.approx(0.0, abs=1.0e-6)
+
+
+def test_template_reuse_interface_matches_fresh_dispatch_on_small_sample():
+    from persistent_inner_dispatch import PersistentInnerDispatchModel
+
+    schema = DecisionSchema(["z1"])
+    config = _config()
+    config["solver"] = {
+        "gurobi": {"time_limit_seconds": 5, "mip_gap": 0.05, "threads": 1},
+        "inner": {"build_mode": "template_reuse", "persistent_template": {"enabled": True}},
+    }
+    config.setdefault("technology", {}).setdefault("liquid_heat_fraction", {})["cold_plate"] = 0.0
+    config.setdefault("technology", {}).setdefault("liquid_heat_fraction", {})["rdhx"] = 0.0
+    vector = schema.encode_default()
+    vector[0] = 1
+    vector[1] = 100.0
+    vector[-2] = 100.0
+    vector[-1] = 150.0
+    decision = schema.decode(vector)
+
+    kwargs = {
+        "decision": decision,
+        "time_frame": _time_frame(),
+        "peak_load_by_zone_kw": {"z1": 100.0},
+        "chiller_old_kw": 0.0,
+        "tower_old_kw": 0.0,
+    }
+
+    fresh = InnerDispatchMILP(config).solve(**kwargs, build_mode="fresh")
+    template = PersistentInnerDispatchModel(config)
+    templated = template.solve(**kwargs, build_mode="template_reuse")
+    reused = template.solve(
+        **kwargs,
+        build_mode="template_reuse",
+        warm_start=templated.warm_start_payload,
+    )
+
+    assert fresh.feasible is True
+    assert templated.feasible is True
+    assert templated.diagnostics["build_mode"] == "template_reuse"
+    assert templated.diagnostics["persistent_template_backend"] == "gurobi_template"
+    assert templated.objective_value == pytest.approx(fresh.objective_value)
+    assert templated.diagnostics["max_power_balance_residual_kw"] == pytest.approx(
+        fresh.diagnostics["max_power_balance_residual_kw"],
+        abs=1.0e-6,
+    )
+    assert reused.feasible is True
+    assert reused.diagnostics["persistent_template_backend"] == "gurobi_template"
+    assert reused.diagnostics["template_reuse_hit"] is True
+    assert reused.diagnostics["warm_start_values_applied"] > 0
+    assert reused.objective_value == pytest.approx(fresh.objective_value)
+    assert reused.diagnostics["max_power_balance_residual_kw"] == pytest.approx(0.0, abs=1.0e-6)
+    assert reused.diagnostics["max_heat_balance_residual_kw"] == pytest.approx(0.0, abs=1.0e-6)
 
 
 def test_dispatch_uses_aged_old_ac_capacity_and_terminal_coefficient():
@@ -519,18 +787,19 @@ def test_operating_and_capital_objectives_use_row_weights_and_fixed_retrofit_cos
 
     decision = schema.decode(vector)
     config = _minimal_config()
-    config["economics"]["capex_yuan_per_kw"] = {"cdu": 50.0}
+    config["economics"]["capex_yuan_per_kw"] = {"cdu": 50.0, "cold_plate": 2500.0}
     config["economics"]["retrofit_fixed_yuan"] = {"4": 1000.0}
-    config["carbon"]["embodied_kg_per_kw"] = {"cdu": 5.0}
+    config["carbon"]["embodied_kg_per_kw"] = {"cdu": 5.0, "cold_plate": 6.0}
     config["carbon"]["retrofit_fixed_kg"] = {"4": 100.0}
+    config["scenario"]["zone_rack_count"] = {"zone_1": 2}
     annualized_cost, annualized_carbon = _capacity_cost(decision, config)
 
     assert _crf(0.0, 20) == pytest.approx(0.05)
-    assert annualized_cost == pytest.approx(150.0)
-    assert annualized_carbon == pytest.approx(15.0)
+    assert annualized_cost == pytest.approx(2750.0)
+    assert annualized_carbon == pytest.approx(31.0)
 
 
-def test_evaluate_solution_adds_weight_soft_penalty_to_objectives(monkeypatch):
+def test_evaluate_solution_clips_capacity_without_soft_objective_penalty(monkeypatch):
     schema = DecisionSchema(["zone_1"])
     vector = schema.encode_default()
     vector[0] = 1
@@ -550,10 +819,10 @@ def test_evaluate_solution_adds_weight_soft_penalty_to_objectives(monkeypatch):
     config["weight"] = {
         "floor_weight_margin_by_zone_kg": {"zone_1": 100.0},
         "equipment_kg_per_kw": {"ac_new": 5.0},
-        "soft_constraint": {
+        "hard_constraint": {
             "enabled": True,
-            "cost_penalty_yuan_per_kg_year": 2.0,
-            "carbon_penalty_kg_per_kg_year": 0.5,
+            "abs_tolerance_kg": 1.0e-6,
+            "relative_tolerance": 1.0e-9,
         },
     }
 
@@ -564,18 +833,19 @@ def test_evaluate_solution_adds_weight_soft_penalty_to_objectives(monkeypatch):
         pd.DataFrame(
             {
                 "timestamp_hour_utc": pd.date_range("2025-01-01", periods=1, freq="h", tz="UTC"),
-                "it_load_kw": [100.0],
+                "it_load_kw": [20.0],
                 "price_yuan_per_kwh": [0.0],
                 "carbon_kg_per_kwh": [0.0],
                 "heating_demand_kw": [0.0],
                 "day_weight": [1.0],
             }
         ),
-        {"zone_1": 100.0},
+        {"zone_1": 20.0},
     )
 
     assert result.feasible is True
-    assert result.tlcc == pytest.approx(800.0)
-    assert result.tce == pytest.approx(200.0)
-    assert result.artifacts["screening"].soft_violation == pytest.approx(400.0)
-    assert result.artifacts["weight_soft_penalty"]["cost_yuan_per_year"] == pytest.approx(800.0)
+    assert result.tlcc == pytest.approx(0.0)
+    assert result.tce == pytest.approx(0.0)
+    assert result.artifacts["screening"].soft_violation == pytest.approx(0.0)
+    assert result.artifacts["weight_soft_penalty"]["cost_yuan_per_year"] == pytest.approx(0.0)
+    assert any("limit_ac_new_to_effective_peak" in action for action in result.artifacts["repair_actions"])

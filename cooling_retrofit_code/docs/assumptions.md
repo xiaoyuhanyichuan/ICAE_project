@@ -12,14 +12,11 @@ model inputs:
 - Chiller COP: `3.0`
 - AC terminal fan coefficient: `0.2137 kWe/kWth`
 
-## Heating Demand Scaling
+## Heating Demand Input
 
-The raw building heating demand peak is about `8 MW`, while the available IT
-waste heat peak is below `1 MW`. For the current waste-heat recovery scenario,
-`heating_demand_kw` is therefore scaled at data-loading time so its peak equals
-`0.9 * peak(it_load_kw)`. The original values are retained in
-`heating_demand_raw_kw`, and the applied multiplier is retained in
-`heating_demand_scale_factor`.
+`heating_demand_kw` is loaded directly from the heating-demand data and is not
+scaled to IT waste heat. In the dispatch model it is treated as an upper bound
+on useful heat delivery, so recovered heat can be credited only up to demand.
 
 ## Placeholder Inputs
 
@@ -27,6 +24,13 @@ The economic parameters, embodied carbon parameters, default COP values,
 equipment weights, and representative zone floor area in `config.json` are
 placeholder assumptions. Before formal paper experiments, they must either be
 replaced with final study inputs or supported with citations.
+
+## Load-Bearing Constraint
+
+The floor load-bearing constraint is implemented as a hard repair/screening
+constraint. A tiny absolute/relative tolerance from `weight.hard_constraint` is
+used only to avoid floating-point boundary misclassification; overweight is not
+converted into an objective penalty.
 
 The current implemented heating side uses WSHP heat recovery only. The WSHP
 source can use recoverable heat from CDU and RDHX/backplate paths. AC and RDHX
@@ -47,3 +51,10 @@ interfaces, commissioning, downtime, and retrofit work. They exclude capacity
 equipment CAPEX and capacity equipment embodied carbon, which are calculated
 separately from installed capacity. This avoids double-counting capacity
 equipment cost or embodied carbon.
+
+For cold-plate/CDU retrofits, the capacity equipment terms are decomposed into
+CDU equipment capacity plus cold-plate IT-side retrofit capacity:
+`Cap_z^{CDU} * C^{CDU} + Cap_z^{CP} * C^{cold_plate}` for CAPEX, and the same
+structure for embodied carbon. `Cap_z^{CP}` is derived from the cold-plate/CDU
+capacity in selected cold-plate configurations. The current default cold-plate
+values are `2500 yuan/kW_IT` and `6 kgCO2e/kW_IT`.

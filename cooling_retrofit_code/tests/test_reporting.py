@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 import run_optimization
-from analyze_results import write_report
+from analyze_results import _runtime_acceleration_lines, write_report
 from model import EvaluationResult
 from plotting import pareto_distribution_frame, save_pareto_plot
 
@@ -154,6 +154,94 @@ def test_write_report_includes_spatial_visualization_section(monkeypatch):
     assert "空调老化率=20.00%" in report
 
 
+def test_write_report_includes_benchmark_comparison_section(monkeypatch):
+    written = {}
+
+    def capture_write(path, text, encoding=None):
+        written["text"] = text
+        return len(text)
+
+    def fake_exists(path):
+        return path.name in {"benchmark_comparison.csv", "benchmark_comparison.png"}
+
+    def fake_read_csv(path, *args, **kwargs):
+        del args, kwargs
+        if Path(path).name == "benchmark_comparison.csv":
+            return pd.DataFrame(
+                {
+                    "scenario_key": [
+                        "baseline_1_no_retrofit",
+                        "baseline_2_aggressive_retrofit",
+                        "proposed_refined_knee",
+                    ],
+                    "scenario_label": [
+                        "Baseline 1: no retrofit",
+                        "Baseline 2: aggressive retrofit",
+                        "Proposed: refined retrofit",
+                    ],
+                    "feasible": [True, True, True],
+                    "tlcc": [1200.0, 1500.0, 900.0],
+                    "tce": [500.0, 350.0, 300.0],
+                    "operational_cost_yuan": [800.0, 600.0, 500.0],
+                    "operational_carbon_kg": [400.0, 250.0, 200.0],
+                    "waste_heat_recovery_rate": [0.0, 0.2, 0.3],
+                    "pue": [1.5, 1.2, 1.1],
+                }
+            )
+        raise AssertionError(f"unexpected csv read: {path}")
+
+    monkeypatch.setattr(Path, "write_text", capture_write)
+    monkeypatch.setattr(Path, "exists", fake_exists)
+    monkeypatch.setattr(pd, "read_csv", fake_read_csv)
+    all_evaluations = pd.DataFrame({"feasible": [True], "tlcc": [1.0], "tce": [2.0]})
+    pareto = all_evaluations.copy()
+
+    write_report(all_evaluations, pareto, {"assumptions": {}}, "out")
+
+    report = written["text"]
+    assert "三方案对比实验" in report
+    assert "三方案对比数据表" in report
+    assert "baseline_1_no_retrofit" in report
+    assert "baseline_2_aggressive_retrofit" in report
+    assert "proposed_refined_knee" in report
+    assert "benchmark_comparison.png" in report
+    assert "本文方案相对 Baseline 1" in report
+    assert "TLCC | TCE | 运行成本 | 运营碳 | 余热回收率" in report
+    assert "降低 25.00%" in report
+    assert "提高 30.00 个百分点" in report
+
+
+def test_runtime_acceleration_lines_include_oom_guardrails():
+    frame = pd.DataFrame(
+        {
+            "build_mode": ["fresh", "fresh"],
+            "parallel_fallback": [True, False],
+            "parallel_fallback_reason": ["MemoryError: out of memory", ""],
+            "parallel_workers": [2, 2],
+            "parallel_chunksize": [1, 1],
+            "gurobi_nodefile_start_gb": [0.5, 0.5],
+            "gurobi_mip_focus": [1, 1],
+            "gurobi_numeric_focus": [1, 1],
+            "gurobi_output_flag": [0, 0],
+            "warm_start_exact_hits": [0, 1],
+            "warm_start_neighbor_hits": [0, 2],
+            "warm_start_misses": [1, 3],
+        }
+    )
+
+    text = "\n".join(_runtime_acceleration_lines(frame))
+
+    assert "parallel fallback rate" in text
+    assert "parallel fallback reasons" in text
+    assert "parallel workers: 2" in text
+    assert "parallel chunksize: 1" in text
+    assert "Gurobi NodefileStart GB: 0.5" in text
+    assert "Gurobi MIPFocus: 1" in text
+    assert "Gurobi NumericFocus: 1" in text
+    assert "Gurobi OutputFlag: 0" in text
+    assert "warm start exact/neighbor/miss: exact=1, neighbor=2, miss=3" in text
+
+
 def test_save_pareto_plot_writes_png_under_figures(monkeypatch):
     calls = {}
 
@@ -261,6 +349,8 @@ def test_run_exports_empty_pareto_without_plot_when_all_solutions_infeasible(mon
     monkeypatch.setattr(run_optimization, "save_convergence_plots", lambda *args: {})
     monkeypatch.setattr(run_optimization, "save_pareto_distribution_plot", lambda *args: None)
     monkeypatch.setattr(run_optimization, "run_spatial_analysis", lambda *args, **kwargs: {"available": True})
+    monkeypatch.setattr(run_optimization, "evaluate_benchmark_scenarios", lambda *args, **kwargs: pd.DataFrame())
+    monkeypatch.setattr(run_optimization, "save_benchmark_comparison_plot", lambda *args, **kwargs: None)
     monkeypatch.setattr(run_optimization, "_resolve_output_dir", lambda loaded_config, config_file: Path("out"))
     monkeypatch.setattr(run_optimization, "write_report", lambda *args: Path("out") / "report.md")
     monkeypatch.setattr(Path, "mkdir", lambda *args, **kwargs: None)
@@ -276,6 +366,7 @@ def test_run_exports_empty_pareto_without_plot_when_all_solutions_infeasible(mon
     assert csv_writes[0][0] == Path("out") / "all_evaluations.csv"
     assert csv_writes[1][0] == Path("out") / "pareto_solutions.csv"
     assert csv_writes[1][1].empty
+    assert csv_writes[2][0] == Path("out") / "benchmark_comparison.csv"
 
 
 def test_run_evaluates_initial_population_and_each_generation(monkeypatch):
@@ -324,6 +415,8 @@ def test_run_evaluates_initial_population_and_each_generation(monkeypatch):
     monkeypatch.setattr(run_optimization, "save_convergence_plots", lambda *args: {})
     monkeypatch.setattr(run_optimization, "save_pareto_distribution_plot", lambda *args: Path("out") / "dist.png")
     monkeypatch.setattr(run_optimization, "run_spatial_analysis", lambda *args, **kwargs: {"available": True, "solution_id": 1})
+    monkeypatch.setattr(run_optimization, "evaluate_benchmark_scenarios", lambda *args, **kwargs: pd.DataFrame({"scenario_key": []}))
+    monkeypatch.setattr(run_optimization, "save_benchmark_comparison_plot", lambda *args, **kwargs: None)
     monkeypatch.setattr(run_optimization, "_resolve_output_dir", lambda loaded_config, config_file: Path("out"))
     monkeypatch.setattr(run_optimization, "write_report", lambda *args: Path("out") / "report.md")
     monkeypatch.setattr(run_optimization, "_write_pareto_artifacts", lambda *args: [], raising=False)

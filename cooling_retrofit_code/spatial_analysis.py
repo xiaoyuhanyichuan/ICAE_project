@@ -233,6 +233,7 @@ def _room_layout_file(figures: Path, room_id: str) -> Path:
 
 def save_room_layout_plot(rack_frame: pd.DataFrame, knee_row: pd.Series, output_dir: str | Path) -> Path:
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
 
     figures = Path(output_dir) / "figures"
     figures.mkdir(parents=True, exist_ok=True)
@@ -246,30 +247,38 @@ def save_room_layout_plot(rack_frame: pd.DataFrame, knee_row: pd.Series, output_
     alpha = pd.to_numeric(rack_frame["alpha_age"], errors="coerce").fillna(0.0)
     rho_span = max(float(rho.max() - rho.min()), 1.0e-9)
     alpha_span = max(float(alpha.max() - alpha.min()), 1.0e-9)
-    size_by_rack = 280.0 + 320.0 * (rho - float(rho.min())) / rho_span
-    linewidth_by_rack = 1.0 + 3.0 * (alpha - float(alpha.min())) / alpha_span
+    size_by_rack = 155.0 + 155.0 * (rho - float(rho.min())) / rho_span
+    linewidth_by_rack = 0.9 + 2.2 * (alpha - float(alpha.min())) / alpha_span
 
     room_ids = sorted(rack_frame["room_id"].astype(str).unique().tolist())
-    x_values = pd.to_numeric(rack_frame["plot_col"], errors="coerce")
-    y_values = pd.to_numeric(rack_frame["plot_row"], errors="coerce")
-    x_min, x_max = float(x_values.min()) - 1.0, float(x_values.max()) + 1.0
-    y_min, y_max = float(y_values.min()) - 0.7, float(y_values.max()) + 0.7
     tlcc = _to_float(knee_row.get("tlcc"), float("nan"))
     tce = _to_float(knee_row.get("tce"), float("nan"))
 
     first_path: Path | None = None
     for room_id in room_ids:
-        fig, ax = plt.subplots(figsize=(7.3, 5.0))
+        fig, ax = plt.subplots(figsize=(10.8, 5.9))
         legend_handles: dict[int, Any] = {}
         room_frame = rack_frame[rack_frame["room_id"].astype(str) == room_id]
+        room_x = pd.to_numeric(room_frame["plot_col"], errors="coerce").fillna(0.0)
+        room_y = pd.to_numeric(room_frame["plot_row"], errors="coerce").fillna(0.0)
+        x_scale = 1.42
+        y_scale = 1.00
+        x_plot = room_x * x_scale
+        y_plot = room_y * y_scale
+        x_range = max(float(room_x.max() - room_x.min()), 1.0)
+        y_range = max(float(room_y.max() - room_y.min()), 1.0)
+        x_margin = max(1.35, 0.08 * x_range) * x_scale
+        y_margin = max(0.85, 0.08 * y_range) * y_scale
         for config_id, group in room_frame.groupby("config_id", sort=True):
             edgecolors = [
                 "red" if _to_float(value, 0.0) >= 0.8 else "black"
                 for value in group["hotspot_risk"].tolist()
             ]
+            group_x = pd.to_numeric(group["plot_col"], errors="coerce").fillna(0.0) * x_scale
+            group_y = pd.to_numeric(group["plot_row"], errors="coerce").fillna(0.0) * y_scale
             scatter = ax.scatter(
-                pd.to_numeric(group["plot_col"], errors="coerce"),
-                pd.to_numeric(group["plot_row"], errors="coerce"),
+                group_x,
+                group_y,
                 s=size_by_rack.loc[group.index],
                 color=colors[int(config_id)],
                 edgecolors=edgecolors,
@@ -279,51 +288,112 @@ def save_room_layout_plot(rack_frame: pd.DataFrame, knee_row: pd.Series, output_
             )
             legend_handles[int(config_id)] = scatter
             for _, row in group.iterrows():
+                label_x = float(row["plot_col"]) * x_scale
+                label_y = float(row["plot_row"]) * y_scale
                 ax.text(
-                    float(row["plot_col"]),
-                    float(row["plot_row"]),
+                    label_x,
+                    label_y,
                     str(row["rack_label"]),
                     ha="center",
                     va="center",
-                    fontsize=7.2,
+                    fontsize=7.8,
+                    color="#111111",
+                    zorder=4,
                 )
                 ax.text(
-                    float(row["plot_col"]),
-                    float(row["plot_row"]) + 0.24,
-                    str(row["ac_unit"]),
-                    ha="center",
-                    va="bottom",
-                    fontsize=4.6,
-                    color="#333333",
-                )
-                ax.text(
-                    float(row["plot_col"]),
-                    float(row["plot_row"]) - 0.24,
+                    label_x,
+                    label_y - 0.42,
                     f"{float(row['rho_load']):.2f}/{float(row['alpha_age']):.2f}",
                     ha="center",
                     va="top",
-                    fontsize=4.4,
+                    fontsize=6.0,
                     color="#222222",
+                    bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.72, "pad": 0.8},
                 )
-        ax.set_title(room_id, fontsize=12, fontweight="bold")
-        ax.set_xlabel("Rack column")
-        ax.set_ylabel("Rack row")
-        ax.set_xlim(x_min, x_max)
-        ax.set_ylim(y_min, y_max)
-        ax.grid(True, linestyle="--", alpha=0.25)
+        xticks = sorted(float(value) for value in room_x.dropna().unique().tolist())
+        yticks = sorted(float(value) for value in room_y.dropna().unique().tolist())
+        ax.set_xlabel("Rack column index", fontsize=11)
+        ax.set_ylabel("Rack row index", fontsize=11)
+        ax.set_xlim(float(x_plot.min()) - x_margin, float(x_plot.max()) + x_margin)
+        ax.set_ylim(float(y_plot.min()) - y_margin, float(y_plot.max()) + y_margin)
+        ax.set_xticks([value * x_scale for value in xticks])
+        ax.set_xticklabels([str(int(value)) if float(value).is_integer() else f"{value:g}" for value in xticks])
+        ax.set_yticks([value * y_scale for value in yticks])
+        ax.set_yticklabels([str(int(value)) if float(value).is_integer() else f"{value:g}" for value in yticks])
+        ax.tick_params(axis="both", labelsize=10)
+        ax.grid(True, linestyle="--", linewidth=0.8, alpha=0.22)
         ax.invert_yaxis()
         ax.set_title(
-            f"{room_id} retrofit configuration - knee solution {int(knee_row.get('solution_id', -1))}\n"
-            f"TLCC={tlcc:,.0f} yuan/year, TCE={tce:,.0f} kgCO2/year; label=rho/alpha",
-            fontsize=12,
+            f"Rack-level retrofit configuration in {room_id}\n"
+            f"Knee solution {int(knee_row.get('solution_id', -1))}: TLCC={tlcc:,.0f} yuan/year, "
+            f"TCE={tce:,.0f} kgCO2/year",
+            fontsize=13,
+            fontweight="semibold",
+            pad=12,
         )
         handles = [legend_handles[key] for key in sorted(legend_handles)]
         labels = [handle.get_label() for handle in handles]
         if handles:
-            ax.legend(handles, labels, loc="center left", bbox_to_anchor=(1.02, 0.5), title="Configuration")
-        fig.tight_layout()
+            alpha_handle = Line2D(
+                [0],
+                [0],
+                marker="o",
+                color="white",
+                markerfacecolor="white",
+                markeredgecolor="black",
+                markeredgewidth=2.4,
+                markersize=9,
+                linestyle="None",
+                label="Ring width: AC aging rate alpha",
+            )
+            rho_handle = Line2D(
+                [0],
+                [0],
+                marker="o",
+                color="white",
+                markerfacecolor="#bbbbbb",
+                markeredgecolor="black",
+                markersize=9,
+                linestyle="None",
+                label="Circle size: rack load growth rho",
+            )
+            hotspot_handle = Line2D(
+                [0],
+                [0],
+                marker="o",
+                color="white",
+                markerfacecolor="white",
+                markeredgecolor="red",
+                markeredgewidth=2.0,
+                markersize=9,
+                linestyle="None",
+                label="Red ring: high hotspot-risk proxy",
+            )
+            handles = handles + [rho_handle, alpha_handle, hotspot_handle]
+            labels = labels + [rho_handle.get_label(), alpha_handle.get_label(), hotspot_handle.get_label()]
+            ax.legend(
+                handles,
+                labels,
+                loc="center left",
+                bbox_to_anchor=(1.02, 0.5),
+                title="Retrofit encoding",
+                fontsize=8.6,
+                title_fontsize=9.5,
+                frameon=True,
+            )
+        ax.text(
+            0.01,
+            0.02,
+            "Rack label: rack ID; small label: rho/alpha",
+            transform=ax.transAxes,
+            ha="left",
+            va="bottom",
+            fontsize=8.8,
+            color="#333333",
+        )
+        fig.tight_layout(rect=(0.0, 0.0, 0.82, 1.0))
         path = _room_layout_file(figures, room_id)
-        fig.savefig(path, dpi=180)
+        fig.savefig(path, dpi=240, bbox_inches="tight")
         plt.close(fig)
         if first_path is None:
             first_path = path

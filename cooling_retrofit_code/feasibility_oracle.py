@@ -60,6 +60,19 @@ class FeasibilityOracle:
         tech = self.config.get("technology", {})
         self.cold_plate_fraction = float(liquid.get("cold_plate", tech.get("cold_plate_heat_fraction", 0.7)))
         self.rdhx_fraction = float(liquid.get("rdhx", 1.0))
+        weight_config_raw = self.config.get("weight", {})
+        weight_config = weight_config_raw if isinstance(weight_config_raw, dict) else {}
+        hard_weight_raw = weight_config.get("hard_constraint", {})
+        hard_weight = hard_weight_raw if isinstance(hard_weight_raw, dict) else {}
+        self.weight_abs_tolerance_kg = float(
+            hard_weight.get("abs_tolerance_kg", weight_config.get("abs_tolerance_kg", 1.0e-6))
+        )
+        self.weight_relative_tolerance = float(
+            hard_weight.get("relative_tolerance", weight_config.get("relative_tolerance", 1.0e-9))
+        )
+        screening_config = self.config.get("solver", {}).get("screening", {})
+        disabled = screening_config.get("disabled_hard_checks", []) if isinstance(screening_config, dict) else []
+        self.disabled_hard_checks = {str(item) for item in disabled}
         self._infeasible_memory: set[tuple[float, ...]] = set()
 
     def evaluate(self, vector: np.ndarray) -> OracleOutcome:
@@ -79,6 +92,8 @@ class FeasibilityOracle:
             cop_wshp=self.cop_wshp,
             cold_plate_fraction=self.cold_plate_fraction,
             rdhx_fraction=self.rdhx_fraction,
+            weight_abs_tolerance_kg=self.weight_abs_tolerance_kg,
+            weight_relative_tolerance=self.weight_relative_tolerance,
         )
         decision = self.schema.decode(repaired_vector)
         signature = self._signature(repaired_vector)
@@ -110,6 +125,9 @@ class FeasibilityOracle:
             cop_wshp=self.cop_wshp,
             cold_plate_fraction=self.cold_plate_fraction,
             rdhx_fraction=self.rdhx_fraction,
+            disabled_hard_checks=self.disabled_hard_checks,
+            weight_abs_tolerance_kg=self.weight_abs_tolerance_kg,
+            weight_relative_tolerance=self.weight_relative_tolerance,
         )
         if self.enable_infeasible_memory and not screening.feasible:
             self._infeasible_memory.add(signature)
